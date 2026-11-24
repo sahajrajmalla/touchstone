@@ -4251,6 +4251,7 @@ dependencies = [
 
 [package.optional-dependencies]
 ui = [
+    { name = "httpx" },
     { name = "langgraph-sdk" },
     { name = "streamlit" },
 ]
@@ -4272,6 +4273,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9,<4" },
     { name = "beautifulsoup4", specifier = ">=4.12,<5" },
+    { name = "httpx", marker = "extra == 'ui'", specifier = ">=0.27,<1" },
     { name = "langchain", specifier = ">=1.0,<2" },
     { name = "langchain-anthropic", specifier = ">=1.0,<2" },
     { name = "langchain-community", specifier = ">=0.4,<0.5" },

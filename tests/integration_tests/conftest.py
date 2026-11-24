@@ -10,9 +10,7 @@ import os
 import urllib.request
 
 import pytest
-from dotenv import load_dotenv
-
-load_dotenv()
+from dotenv import dotenv_values
 
 REQUIRED_ENV_VARS = (
     "ANTHROPIC_API_KEY",
@@ -34,7 +32,11 @@ def _elasticsearch_reachable(url: str) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _require_live_services() -> None:
+def _require_live_services(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Load .env for these tests only, so it never leaks into the unit tests.
+    for key, value in dotenv_values().items():
+        if value is not None and key not in os.environ:
+            monkeypatch.setenv(key, value)
     missing = [name for name in REQUIRED_ENV_VARS if name not in os.environ]
     if missing:
         pytest.skip(f"set {', '.join(missing)} in .env to run integration tests")

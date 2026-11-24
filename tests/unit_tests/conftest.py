@@ -36,6 +36,8 @@ _ISOLATED_ENV_VARS = (
     "ELASTICSEARCH_HOST",
     "ELASTICSEARCH_PORT",
     "TOUCHSTONE_API_URL",
+    "LANGSMITH_TRACING",
+    "LANGCHAIN_TRACING_V2",
 )
 
 
@@ -43,6 +45,10 @@ _ISOLATED_ENV_VARS = (
 def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in _ISOLATED_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    # The UI loads .env on startup; never let a developer's .env leak into tests.
+    import touchstone_ui.settings
+
+    monkeypatch.setattr(touchstone_ui.settings, "load_dotenv", lambda **_: False)
 
 
 def config(user_id: str = "alice", **configurable: Any) -> dict[str, Any]:

@@ -1,0 +1,12 @@
+# Streamlit settings for the Touchstone UI (`make ui`).
+# Light/dark mode follows the viewer's system setting.
+
+[theme]
+primaryColor = "#4F46E5"
+
+[browser]
+# Don't send usage statistics to Streamlit.
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
