@@ -25,7 +25,7 @@ try:
     from urllib.parse import urlparse
 
     import aiohttp
-    import PyPDF2
+    import pypdf
 
     DOCUMENT_PROCESSING_AVAILABLE = True
 except ImportError:
@@ -270,7 +270,7 @@ async def extract_text_from_pdf_url(pdf_url: str) -> str:
         str: Extracted text content from the PDF.
     """
     if not DOCUMENT_PROCESSING_AVAILABLE:
-        return "Document processing dependencies not available. Please install: pip install aiohttp PyPDF2"
+        return "Document processing dependencies not available. Please install: pip install aiohttp pypdf"
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -278,7 +278,7 @@ async def extract_text_from_pdf_url(pdf_url: str) -> str:
                 if response.status == 200:
                     pdf_content = await response.read()
                     pdf_file = io.BytesIO(pdf_content)
-                    pdf_reader = PyPDF2.PdfReader(pdf_file)
+                    pdf_reader = pypdf.PdfReader(pdf_file)
 
                     text = ""
                     for page in pdf_reader.pages:
@@ -346,12 +346,12 @@ async def create_documents_from_urls(urls: List[str]) -> List[Document]:
     """
     if not DOCUMENT_PROCESSING_AVAILABLE:
         logging.warning(
-            "Document processing dependencies not available. Please install: pip install aiohttp PyPDF2 beautifulsoup4"
+            "Document processing dependencies not available. Please install: pip install aiohttp pypdf beautifulsoup4"
         )
         # Return documents with error information instead of empty list
         return [
             Document(
-                page_content="Document processing dependencies not available. Please install: pip install aiohttp PyPDF2 beautifulsoup4",
+                page_content="Document processing dependencies not available. Please install: pip install aiohttp pypdf beautifulsoup4",
                 metadata={"source": url, "type": "error", "title": "Dependency Error", "extraction_success": False}
             ) for url in urls
         ]
