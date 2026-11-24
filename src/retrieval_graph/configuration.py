@@ -1,14 +1,45 @@
-"""Define the configurable parameters for the agent."""
+"""Configurable parameters for the indexing and retrieval graphs.
+
+Values are read from the ``configurable`` section of a run's config - for example the
+configuration panel in LangGraph Studio, the Touchstone UI's sidebar, or
+``graph.ainvoke(inputs, {"configurable": {"user_id": "alice"}})``.
+"""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, fields
-from typing import Annotated, Any, Literal, Optional, Type, TypeVar
+from typing import Annotated, Any, Literal, Self
 
 from langchain_core.runnables import RunnableConfig, ensure_config
 
 from retrieval_graph import prompts
-import os
+
+# Defaults. The previous defaults (claude-3-5-sonnet-20240620,
+# claude-3-haiku-20240307 and Google's text-embedding-004) have been retired by
+# their providers and now fail with "model not found".
+DEFAULT_EMBEDDING_MODEL = "google/gemini-embedding-001"
+DEFAULT_RESPONSE_MODEL = "anthropic/claude-sonnet-5-5"
+DEFAULT_QUERY_MODEL = "anthropic/claude-haiku-5-5"
+
+
+def normalize_embedding_model(name: str) -> str:
+    """Return ``name`` in ``provider/model`` form, adding Google's ``models/`` prefix.
+
+    Names without a provider are assumed to be Google models.
+
+    Examples:
+        >>> normalize_embedding_model("google/gemini-embedding-001")
+        'google/models/gemini-embedding-001'
+        >>> normalize_embedding_model("gemini-embedding-001")
+        'google/models/gemini-embedding-001'
+    """
+    if "/" not in name:
+        name = f"google/{name}"
+    provider, model = name.split("/", maxsplit=1)
+    if provider == "google" and not model.startswith("models/"):
+        return f"google/models/{model}"
+    return name
 
 
 @dataclass(kw_only=True)
@@ -22,26 +53,36 @@ class IndexConfiguration:
 
     user_id: str = field(
         default_factory=lambda: os.getenv("USER_ID", ""),
-        metadata={"description": "Unique identifier for the user."}
+        metadata={
+            "description": "Unique identifier for the user. Documents are indexed "
+            "and retrieved per user. Defaults to the USER_ID environment variable."
+        },
     )
-    
+
     elasticsearch_host: str = field(
         default_factory=lambda: os.getenv("ELASTICSEARCH_HOST", "localhost"),
-        metadata={"description": "Hostname or IP address of the Elasticsearch server."}
+        metadata={
+            "description": "Informational only: the connection uses the "
+            "ELASTICSEARCH_URL environment variable."
+        },
     )
-    
+
     elasticsearch_port: int = field(
         default_factory=lambda: int(os.getenv("ELASTICSEARCH_PORT", "9200")),
-        metadata={"description": "Port number for the Elasticsearch server."}
+        metadata={
+            "description": "Informational only: the connection uses the "
+            "ELASTICSEARCH_URL environment variable."
+        },
     )
 
     embedding_model: Annotated[
         str,
         {"__template_metadata__": {"kind": "embeddings"}},
     ] = field(
-        default="google/text-embedding-004",
+        default=DEFAULT_EMBEDDING_MODEL,
         metadata={
-            "description": "Name of the embedding model to use. Must be a valid embedding model name."
+            "description": "Name of the embedding model to use, as provider/model. "
+            "Only Google ('google/...') embedding models are supported."
         },
     )
 
@@ -58,56 +99,37 @@ class IndexConfiguration:
     search_kwargs: dict[str, Any] = field(
         default_factory=lambda: {"k": 1, "score_threshold": 0.7},
         metadata={
-            "description": "Additional keyword arguments to pass to the search function of the retriever. "
-            "Default k=1 limits to one document, score_threshold=0.7 ensures only relevant documents are returned."
+            "description": "Keyword arguments for the retriever's similarity search. "
+            "'k' is the number of documents returned per search (default 1). "
+            "Note: 'score_threshold' is not applied by the default similarity search."
         },
     )
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Validate configuration after initialization."""
         if not self.user_id or self.user_id == "default_user":
             raise ValueError("Please provide a valid user_id in the configuration.")
-        
-        # Ensure embedding_model is not None or empty
-        if not self.embedding_model:
-            self.embedding_model = "google/text-embedding-004"
-        
-        # Fix Google embedding model names to the correct format
-        if self.embedding_model:
-            if self.embedding_model.startswith("google/") and not self.embedding_model.startswith("google/models/"):
-                if "text-embedding-005" in self.embedding_model:
-                    # text-embedding-005 is not available, use text-embedding-004 instead
-                    self.embedding_model = "google/models/text-embedding-004"
-                elif "text-embedding-004" in self.embedding_model:
-                    self.embedding_model = "google/models/text-embedding-004"
-                else:
-                    # For other Google models, add the models/ prefix
-                    model_name = self.embedding_model.split("/", 1)[1]
-                    self.embedding_model = f"google/models/{model_name}"
-            elif "/" not in self.embedding_model:
-                # If no provider specified, assume it's a Google model and add the proper prefix
-                self.embedding_model = f"google/models/{self.embedding_model}"
+        self.embedding_model = normalize_embedding_model(
+            self.embedding_model or DEFAULT_EMBEDDING_MODEL
+        )
 
     @classmethod
-    def from_runnable_config(
-        cls: Type[T], config: Optional[RunnableConfig] = None
-    ) -> T:
-        """Create an IndexConfiguration instance from a RunnableConfig object.
+    def from_runnable_config(cls, config: RunnableConfig | None = None) -> Self:
+        """Create an instance from the ``configurable`` section of a RunnableConfig.
+
+        Unknown keys (for example ``thread_id``, which the LangGraph server adds) are
+        ignored.
 
         Args:
-            cls (Type[T]): The class itself.
-            config (Optional[RunnableConfig]): The configuration object to use.
+            config: The configuration object to use.
 
         Returns:
-            T: An instance of IndexConfiguration with the specified configuration.
+            An instance of the class with the specified configuration.
         """
         config = ensure_config(config)
         configurable = config.get("configurable") or {}
         _fields = {f.name for f in fields(cls) if f.init}
         return cls(**{k: v for k, v in configurable.items() if k in _fields})
-
-
-T = TypeVar("T", bound=IndexConfiguration)
 
 
 @dataclass(kw_only=True)
@@ -116,47 +138,53 @@ class Configuration(IndexConfiguration):
 
     response_system_prompt: str = field(
         default=prompts.RESPONSE_SYSTEM_PROMPT,
-        metadata={"description": "The system prompt used for generating responses."},
+        metadata={
+            "description": "Reserved: not currently used. Specialist prompts live "
+            "in retrieval_graph/prompts.py."
+        },
     )
 
     response_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="anthropic/claude-3-5-sonnet-20240620",
+        default=DEFAULT_RESPONSE_MODEL,
         metadata={
-            "description": "The language model used for generating responses. Should be in the form: provider/model-name."
+            "description": "The language model used by the specialist and critique "
+            "agents. Should be in the form: provider/model-name."
         },
     )
 
     query_system_prompt: str = field(
         default=prompts.QUERY_SYSTEM_PROMPT,
         metadata={
-            "description": "The system prompt used for processing and refining queries."
+            "description": "Reserved: not currently used. The classifier prompt "
+            "lives in retrieval_graph/prompts.py."
         },
     )
 
     query_model: Annotated[str, {"__template_metadata__": {"kind": "llm"}}] = field(
-        default="anthropic/claude-3-haiku-20240307",
+        default=DEFAULT_QUERY_MODEL,
         metadata={
-            "description": "The language model used for processing and refining queries. Should be in the form: provider/model-name."
+            "description": "The language model used to classify queries into a "
+            "subject. Should be in the form: provider/model-name."
         },
     )
 
     enable_web_search: bool = field(
         default=True,
         metadata={
-            "description": "Whether to enable web search when local retrieval is insufficient."
+            "description": "Whether the specialist agents may use the web_search "
+            "tool (Tavily)."
         },
     )
 
     web_search_api_key: str = field(
         default_factory=lambda: os.getenv("TAVILY_API_KEY", ""),
         metadata={
-            "description": "API key for web search service (Tavily)."
+            "description": "API key for web search service (Tavily). Defaults to "
+            "the TAVILY_API_KEY environment variable."
         },
     )
 
     min_retrieval_threshold: int = field(
         default=2,
-        metadata={
-            "description": "Minimum number of documents required from local retrieval before triggering web search."
-        },
+        metadata={"description": "Reserved: not currently used."},
     )

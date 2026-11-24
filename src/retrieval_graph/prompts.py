@@ -1,3 +1,16 @@
+"""Prompt templates for the classifier, specialist and critique agents.
+
+Each template is rendered with ``ChatPromptTemplate.from_template`` - keep the
+``{placeholders}`` intact when editing:
+
+* specialists: ``{question}``, ``{retrieved_docs}``, ``{critique_feedback}``
+* critique: ``{user_question}``, ``{agent_response}``, ``{retrieved_docs}``
+* classification: ``{question}``
+
+``QUERY_SYSTEM_PROMPT`` and ``RESPONSE_SYSTEM_PROMPT`` are only used as defaults of
+the (currently unused) ``query_system_prompt`` / ``response_system_prompt`` fields.
+"""
+
 QUERY_SYSTEM_PROMPT = """You are a query processing specialist. Your role is to analyze and refine user queries to optimize retrieval from the knowledge base.
 
 IMPORTANT: Only process queries that actually need retrieval. DO NOT process:

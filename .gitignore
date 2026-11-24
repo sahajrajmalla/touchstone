@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# LangGraph dev server local state (`make dev`)
+.langgraph_api/

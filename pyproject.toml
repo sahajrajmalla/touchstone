@@ -1,5 +1,5 @@
 [project]
-name = "KnowledgeRetrievalReasoningSystem"
+name = "touchstone"
 version = "0.0.1"
 description = "An intelligent Multi-Agent System for Knowledge Retrieval and Reasoning in Education."
 authors = [
@@ -8,61 +8,134 @@ authors = [
 license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.11"
+# Lower bounds document the APIs this code is written against; upper bounds stop a
+# fresh (unlocked) install from silently picking up a breaking major release.
+# `uv.lock` pins the exact, tested versions.
 dependencies = [
-    "langchain-core",
-    "langchain-community",
-    "langgraph",
-    "langchain-anthropic",
-    "langchain",
-    "python-dotenv",
-    "langchain-elasticsearch",
-    "msgspec",
-    "langchain-google-genai",
-    "langgraph-api",
-    "aiohttp",
-    "PyPDF2",
-    "beautifulsoup4",
-    "tavily-python",
-    "pydantic"
+    "langgraph>=1.0,<2",
+    "langchain>=1.0,<2",
+    "langchain-core>=1.0,<2",
+    "langchain-anthropic>=1.0,<2",
+    # Only used for the Tavily web-search tool (TavilySearchResults).
+    "langchain-community>=0.4,<0.5",
+    # 1.x renamed AsyncElasticsearchStore(es_connection=...) to client=...
+    "langchain-elasticsearch>=1.0,<2",
+    "langchain-google-genai>=4.0,<5",
+    "pydantic>=2.7,<3",
+    "aiohttp>=3.9,<4",
+    "beautifulsoup4>=4.12,<5",
+    "pypdf>=5,<7",
+    "python-dotenv>=1.0,<2",
 ]
 
 [project.optional-dependencies]
-dev = ["mypy", "ruff"]
+# Web UI (Streamlit) that talks to the LangGraph server.
+ui = [
+    "streamlit>=1.45,<2",
+    "langgraph-sdk>=0.2,<1",
+    "httpx>=0.27,<1",
+]
+
+[dependency-groups]
+dev = [
+    # `langgraph dev`: local LangGraph server + Studio, no Docker required.
+    "langgraph-cli[inmem]>=0.4,<0.5",
+    "langsmith>=0.3",
+    "mypy>=1.13",
+    "pre-commit>=4.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "pytest-watcher>=0.4",
+    "ruff>=0.8",
+]
 
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["langgraph.templates.retrieval_graph", "retrieval_graph"]
-[tool.setuptools.package-dir]
-"langgraph.templates.retrieval_graph" = "src/retrieval_graph"
-"retrieval_graph" = "src/retrieval_graph"
-
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
 
+######################
+# Linting / formatting
+######################
+
 [tool.ruff]
-lint.select = [
-    "E",    # pycodestyle
-    "F",    # pyflakes
-    "I",    # isort
-    "D",    # pydocstyle
-    "D401", # First line should be in imperative mood
-    "T201",
-    "UP",
+target-version = "py311"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle
+    "F",     # pyflakes
+    "I",     # isort
+    "D",     # pydocstyle
+    "D401",  # First line should be in imperative mood
+    "T201",  # print
+    "UP",    # pyupgrade
+    "B",     # flake8-bugbear
+    "ASYNC", # blocking calls inside async code (matters for `langgraph dev`)
+    "SIM",   # flake8-simplify
 ]
-lint.ignore = [
-    "UP006",
-    "UP007",
-    # We actually do want to import from typing_extensions
-    "UP035",
+ignore = [
     # Relax the convention by _not_ requiring documentation for every function parameter.
     "D417",
+    # Long prompt strings and URLs are fine.
     "E501",
 ]
+
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D", "UP"]
+"tests/**" = ["D", "UP"]
+"scripts/**" = ["T201"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+######################
+# Type checking
+######################
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+files = ["src", "scripts"]
+warn_unreachable = true
+
+######################
+# Tests
+######################
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: needs live services and API keys (Elasticsearch, Anthropic, Google).",
+]
+filterwarnings = [
+    # Kept on purpose: switching to `context_schema` changes how callers pass
+    # configuration (see docs/development.md). Revisit before LangGraph 2.0.
+    "ignore:`config_schema` is deprecated:DeprecationWarning",
+    # Web search still uses langchain-community's TavilySearchResults; migrating
+    # to `langchain-tavily` is tracked in docs/development.md.
+    "ignore:`langchain-community` is being sunset:DeprecationWarning",
+    "ignore:The class `TavilySearchResults` was deprecated",
+]
+
+[tool.coverage.run]
+source = ["retrieval_graph", "touchstone_ui"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

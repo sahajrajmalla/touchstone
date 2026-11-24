@@ -1,19 +1,33 @@
-"""Main entrypoint for the conversational retrieval graph.
+"""Multi-agent retrieval graph.
 
-This module defines the core structure and functionality of the conversational
-retrieval graph. It includes the main graph definition, state management,
-and key functions for processing user inputs, generating queries, retrieving
-relevant documents, and formulating responses.
+Flow for every user turn::
+
+    classify_query -> <subject>_agent <-> tools
+                           |
+                           v
+                     critique_agent -> respond
+                           |
+                           +-> (retry) back to the same <subject>_agent
+
+* ``classify_query`` routes the question to one of the specialist agents.
+* A specialist agent answers, optionally calling the ``retrieve_documents`` /
+  ``web_search`` tools first (executed by the ``tools`` node).
+* ``critique_agent`` reviews the draft and either accepts it (``respond``) or sends
+  it back to the same specialist with feedback.
+
+To add a specialist, add a prompt in :mod:`retrieval_graph.prompts`, register it in
+``SPECIALISTS`` below and extend the ``subject`` literal in ``QueryClassification``.
 """
 
-from typing import Literal, cast
+from collections.abc import Awaitable, Callable, Hashable, Sequence
+from typing import Any, Literal, cast
 
 from langchain_core.documents import Document
-from langchain_core.messages import BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import tool
-from langgraph.graph import StateGraph
+from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
 from retrieval_graph import prompts, retrieval
@@ -21,532 +35,493 @@ from retrieval_graph.configuration import Configuration
 from retrieval_graph.state import InputState, State
 from retrieval_graph.utils import format_docs_safe, get_message_text, load_chat_model
 
-# Define the function that calls the model
+NodeUpdate = dict[str, Any]
+"""A partial state update returned by a graph node."""
+
 
 class QueryClassification(BaseModel):
     """Classification of user query into subject areas."""
-    
+
     subject: Literal["science", "history", "literature", "general"]
 
 
 class CritiqueDecision(BaseModel):
     """Decision from critique agent whether to retry or respond."""
-    
+
     decision: Literal["respond", "retry", "improve_query"]
     reasoning: str
 
 
-async def classify_query(
-    state: State, *, config: RunnableConfig
-) -> dict[str, str]:
-    """Classify the user's query into subject areas."""
-    configuration = Configuration.from_runnable_config(config)
-    
-    user_question = get_original_user_question(state)
-    
-    prompt = ChatPromptTemplate.from_template(prompts.CLASSIFICATION_SYSTEM_PROMPT)
-    model = load_chat_model(configuration.query_model).with_structured_output(QueryClassification)
-    
-    message_value = await prompt.ainvoke({"question": user_question}, config)
-    classification = cast(QueryClassification, await model.ainvoke(message_value, config))
-    
-    return {"classification": classification.subject}
+# Specialist registry: graph node name -> (subject, prompt template, description).
+# The insertion order is the order nodes are added to the graph.
+SPECIALISTS: dict[str, tuple[str, str, str]] = {
+    "science_agent": (
+        "science",
+        prompts.SCIENCE_AGENT_PROMPT,
+        "Science subject specialist agent.",
+    ),
+    "history_agent": (
+        "history",
+        prompts.HISTORY_AGENT_PROMPT,
+        "History subject specialist agent.",
+    ),
+    "literature_agent": (
+        "literature",
+        prompts.LITERATURE_AGENT_PROMPT,
+        "Literature subject specialist agent.",
+    ),
+    "general_agent": (
+        "general",
+        prompts.GENERAL_AGENT_PROMPT,
+        "General knowledge specialist agent.",
+    ),
+}
+DEFAULT_SPECIALIST = "general_agent"
+_SUBJECT_TO_SPECIALIST = {
+    subject: node for node, (subject, _, _) in SPECIALISTS.items()
+}
+
+# Loop guards. Without them an empty knowledge base, a failing search, or a critic
+# that keeps asking for retries makes the run loop until LangGraph aborts it with a
+# GraphRecursionError, and the user gets no answer at all.
+MAX_TOOL_ROUNDS = 3
+"""Tool rounds a specialist may request per user turn before it must answer."""
+MAX_CRITIQUE_RETRIES = 2
+"""Times the critic may send a draft back per user turn before it is accepted."""
 
 
-# Helper function to get original user question
-def get_original_user_question(state: State) -> str:
-    """Extract the original user question from the message history."""
-    # Look for the first human message
-    for msg in state.messages:
-        if hasattr(msg, 'type') and msg.type == 'human':
+######################
+# Turn helpers
+######################
+
+
+def _current_turn(messages: Sequence[AnyMessage]) -> Sequence[AnyMessage]:
+    """Return the messages produced after the latest human message."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].type == "human":
+            return messages[i + 1 :]
+    return messages
+
+
+def _tool_rounds_this_turn(state: State) -> int:
+    """Count the specialist messages that requested tools during this turn."""
+    return sum(
+        1
+        for msg in _current_turn(state.messages)
+        if isinstance(msg, AIMessage) and msg.tool_calls
+    )
+
+
+def _drafts_this_turn(state: State) -> int:
+    """Count the specialist answers (messages without tool calls) this turn."""
+    return sum(
+        1
+        for msg in _current_turn(state.messages)
+        if isinstance(msg, AIMessage) and not msg.tool_calls
+    )
+
+
+def get_latest_user_question(state: State) -> str:
+    """Return the text of the latest human message (the question of this turn).
+
+    Falls back to the first message if the history contains no human message.
+    """
+    for msg in reversed(state.messages):
+        if msg.type == "human":
             return get_message_text(msg)
-    
-    # Fallback to first message if no human message found
-    if state.messages:
-        return get_message_text(state.messages[0])
-    
-    return ""
+    return get_message_text(state.messages[0]) if state.messages else ""
 
 
-# Create simple tools using the @tool decorator
+async def classify_query(state: State, config: RunnableConfig) -> NodeUpdate:
+    """Classify the user's query into subject areas.
+
+    This is the first node of every turn, so it also clears the per-turn fields:
+    in a persistent thread (LangGraph Studio, the Touchstone UI) the previous
+    question's documents and critique would otherwise leak into this one.
+    """
+    configuration = Configuration.from_runnable_config(config)
+    user_question = get_latest_user_question(state)
+
+    prompt = ChatPromptTemplate.from_template(prompts.CLASSIFICATION_SYSTEM_PROMPT)
+    model = load_chat_model(configuration.query_model).with_structured_output(
+        QueryClassification
+    )
+
+    message_value = await prompt.ainvoke({"question": user_question}, config)
+    classification = cast(
+        QueryClassification, await model.ainvoke(message_value, config)
+    )
+    return {
+        "classification": classification.subject,
+        "retrieved_docs": [],
+        "agent_response": None,
+        "critique_decision": None,
+        "critique_feedback": None,
+    }
+
+
+######################
+# Tools
+######################
+
+# These tools are bound to the specialist models so they can *request* a search.
+# The searches themselves are executed by `handle_tool_calls` (the "tools" node),
+# which also stores the results in `state.retrieved_docs`.
+
+
 @tool
 async def retrieve_documents(query: str) -> str:
     """Retrieve documents from the knowledge base using semantic search.
-    
+
     Args:
         query: The search query to use for retrieval
-        
+
     Returns:
         String representation of retrieved documents
     """
     return f"Searching knowledge base for: {query}"
 
-@tool  
+
+@tool
 async def web_search(query: str) -> str:
     """Search the web for information when local knowledge is insufficient.
-    
+
     Args:
         query: The search query to use for web search
-        
+
     Returns:
         String representation of web search results
     """
     return f"Searching web for: {query}"
 
-# Define tools list for binding to models
+
 tools = [retrieve_documents, web_search]
-# Custom tool execution function
-async def handle_tool_calls(state: State, config: RunnableConfig) -> dict:
-    """Handle tool calls and execute actual retrieval/search."""
-    messages_to_add = []
-    retrieved_docs = list(state.retrieved_docs) if state.retrieved_docs else []
-    
-    # Find the last message with tool calls
+
+MAX_STORED_CHARS_PER_DOC = 3000
+"""Characters of each retrieved document kept in state (~750 tokens)."""
+MAX_WEB_RESULT_CHARS = 2000
+"""Characters of each web search result kept in state."""
+MAX_STORED_DOCS = 5
+"""Only the most recent documents are kept in state."""
+WEB_SEARCH_MAX_RESULTS = 3
+
+
+async def _run_retrieval(
+    query: str, config: RunnableConfig
+) -> tuple[str, list[Document]]:
+    """Search the knowledge base; return the tool message text and new documents."""
+    try:
+        async with retrieval.make_retriever(config) as retriever:
+            docs = await retriever.ainvoke(query, config)
+    except Exception as e:
+        return f"Error during retrieval: {e!s}", []
+
+    if not docs:
+        content = "No documents found in the knowledge base for this query."
+        # Suggest the web_search tool when local retrieval found nothing.
+        if Configuration.from_runnable_config(config).enable_web_search:
+            content += "\nYou may want to try using web_search for this query."
+        return content, []
+
+    # Truncate document content before storing to prevent token overflow.
+    stored = []
+    for doc in docs:
+        content = doc.page_content
+        if len(content) > MAX_STORED_CHARS_PER_DOC:
+            content = (
+                content[:MAX_STORED_CHARS_PER_DOC]
+                + "... [TRUNCATED FOR TOKEN EFFICIENCY]"
+            )
+        stored.append(Document(page_content=content, metadata=doc.metadata))
+
+    # Keep the tool response concise to prevent token overflow.
+    summary = "\n\n".join(
+        f"Document {i + 1}:\nContent: {doc.page_content[:300]}...\n"
+        f"Source: {doc.metadata.get('source', 'Unknown')}"
+        for i, doc in enumerate(docs)
+    )
+    return f"Retrieved {len(docs)} relevant document(s):\n\n{summary}", stored
+
+
+async def _run_web_search(
+    query: str, config: RunnableConfig
+) -> tuple[str, list[Document]]:
+    """Search the web with Tavily; return the tool message text and new documents."""
+    configuration = Configuration.from_runnable_config(config)
+    if not configuration.enable_web_search:
+        return "Web search is disabled in the configuration.", []
+
+    try:
+        from langchain_community.tools import TavilySearchResults
+        from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
+
+        if configuration.web_search_api_key:
+            search_tool = TavilySearchResults(
+                max_results=WEB_SEARCH_MAX_RESULTS,
+                api_wrapper=TavilySearchAPIWrapper(
+                    tavily_api_key=configuration.web_search_api_key  # type: ignore[arg-type]
+                ),
+            )
+        else:  # The wrapper falls back to the TAVILY_API_KEY environment variable.
+            search_tool = TavilySearchResults(max_results=WEB_SEARCH_MAX_RESULTS)
+        # Async call: a sync HTTP request would block the event loop (and is
+        # rejected by `langgraph dev`).
+        search_results = await search_tool.ainvoke({"query": query})
+        if isinstance(search_results, str):  # The tool reports failures as text.
+            return f"Error during web search: {search_results}", []
+
+        web_docs = []
+        for result in search_results:
+            if isinstance(result, dict):
+                content = result.get("content", "")
+                if len(content) > MAX_WEB_RESULT_CHARS:
+                    content = (
+                        content[:MAX_WEB_RESULT_CHARS] + "... [WEB CONTENT TRUNCATED]"
+                    )
+                web_docs.append(
+                    Document(
+                        page_content=content,
+                        metadata={
+                            "source": result.get("url", ""),
+                            "title": result.get("title", ""),
+                            "type": "web_search",
+                        },
+                    )
+                )
+    except Exception as e:
+        return f"Error during web search: {e!s}", []
+
+    if not web_docs:
+        return "No results found from web search.", []
+
+    summary = "\n\n".join(
+        f"Result {i + 1}:\nTitle: {doc.metadata.get('title', 'No title')}\n"
+        f"Content: {doc.page_content[:200]}...\n"
+        f"Source: {doc.metadata.get('source', 'Unknown')}"
+        for i, doc in enumerate(web_docs)
+    )
+    return f"Found {len(web_docs)} relevant web result(s):\n\n{summary}", web_docs
+
+
+async def handle_tool_calls(state: State, config: RunnableConfig) -> NodeUpdate:
+    """Execute the tool calls requested by the last specialist message."""
+    messages_to_add: list[ToolMessage] = []
+    retrieved_docs = list(state.retrieved_docs)
+
     last_message = state.messages[-1] if state.messages else None
-    if not hasattr(last_message, 'tool_calls') or not last_message.tool_calls:
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
         return {"messages": messages_to_add, "retrieved_docs": retrieved_docs}
-    
+
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
-        tool_args = tool_call["args"]
-        query = tool_args.get("query", "")
-        
+        query = tool_call["args"].get("query", "")
+
         if tool_name == "retrieve_documents":
-            try:
-                with retrieval.make_retriever(config) as retriever:
-                    # Only retrieve a limited number of documents (k=1 by default from configuration)
-                    docs = await retriever.ainvoke(query, config)
-                    
-                    # Add to our retrieved documents list
-                    if docs:
-                        # Truncate document content before storing to prevent token overflow
-                        truncated_docs = []
-                        for doc in docs:
-                            # Limit individual document content to prevent excessive accumulation
-                            content = doc.page_content
-                            if len(content) > 3000:  # 3000 chars ~ 750 tokens
-                                content = content[:3000] + "... [TRUNCATED FOR TOKEN EFFICIENCY]"
-                            
-                            truncated_doc = Document(
-                                page_content=content,
-                                metadata=doc.metadata
-                            )
-                            truncated_docs.append(truncated_doc)
-                        
-                        # Only add relevant documents to state
-                        retrieved_docs.extend(truncated_docs)
-                        
-                        # Format a summary of the retrieved documents for the tool response
-                        # Keep tool response concise to prevent token overflow
-                        docs_content = "\n\n".join([
-                            f"Document {i+1}:\nContent: {doc.page_content[:300]}...\nSource: {doc.metadata.get('source', 'Unknown')}"
-                            for i, doc in enumerate(docs)
-                        ])
-                        content = f"Retrieved {len(docs)} relevant document(s):\n\n{docs_content}"
-                    else:
-                        content = "No documents found in the knowledge base for this query."
-                        
-                        # If no documents found in local retrieval and we have web search configured,
-                        # suggest using web_search tool
-                        configuration = Configuration.from_runnable_config(config)
-                        if configuration.enable_web_search:
-                            content += "\nYou may want to try using web_search for this query."
-                        
-            except Exception as e:
-                content = f"Error during retrieval: {str(e)}"
-                
+            content, new_docs = await _run_retrieval(query, config)
         elif tool_name == "web_search":
-            try:
-                from langchain_community.tools import TavilySearchResults
-                
-                # Limit web search results to 3 for more focused and relevant results
-                search_tool = TavilySearchResults(max_results=3)
-                search_results = search_tool.invoke({"query": query})
-                
-                web_docs = []
-                for result in search_results:
-                    if isinstance(result, dict):
-                        # Truncate web content to prevent token overflow
-                        content = result.get("content", "")
-                        if len(content) > 2000:  # Limit web content to 2000 chars
-                            content = content[:2000] + "... [WEB CONTENT TRUNCATED]"
-                        
-                        doc = Document(
-                            page_content=content,
-                            metadata={
-                                "source": result.get("url", ""),
-                                "title": result.get("title", ""),
-                                "type": "web_search"
-                            }
-                        )
-                        web_docs.append(doc)
-                
-                # Add to our retrieved documents list
-                retrieved_docs.extend(web_docs)
-                
-                if web_docs:
-                    docs_content = "\n\n".join([
-                        f"Result {i+1}:\nTitle: {doc.metadata.get('title', 'No title')}\nContent: {doc.page_content[:200]}...\nSource: {doc.metadata.get('source', 'Unknown')}"
-                        for i, doc in enumerate(web_docs)
-                    ])
-                    content = f"Found {len(web_docs)} relevant web result(s):\n\n{docs_content}"
-                else:
-                    content = "No results found from web search."
-                    
-            except Exception as e:
-                content = f"Error during web search: {str(e)}"
+            content, new_docs = await _run_web_search(query, config)
         else:
-            content = f"Unknown tool: {tool_name}"
-            
-        # Add tool message
-        tool_message = ToolMessage(
-            content=content,
-            tool_call_id=tool_call["id"],
-            name=tool_name
+            content, new_docs = f"Unknown tool: {tool_name}", []
+
+        retrieved_docs.extend(new_docs)
+        messages_to_add.append(
+            ToolMessage(content=content, tool_call_id=tool_call["id"], name=tool_name)
         )
-        messages_to_add.append(tool_message)
-    
-    # Limit total documents to prevent token overflow in subsequent calls
-    if len(retrieved_docs) > 5:
-        retrieved_docs = retrieved_docs[-5:]  # Keep only the 5 most recent documents
-    
+
+    # Limit total documents to prevent token overflow in subsequent calls.
+    retrieved_docs = retrieved_docs[-MAX_STORED_DOCS:]
     return {"messages": messages_to_add, "retrieved_docs": retrieved_docs}
 
 
-# Agent Functions - Simplified specialist agents
-async def science_agent(
-    state: State, *, config: RunnableConfig
-) -> dict:
-    """Science subject specialist agent."""
+######################
+# Agents
+######################
+
+
+async def _run_specialist(
+    state: State, config: RunnableConfig, prompt_template: str
+) -> NodeUpdate:
+    """Answer the user's question with a subject-specific prompt and tools."""
     configuration = Configuration.from_runnable_config(config)
-    
-    user_question = get_original_user_question(state)
-    
-    # Check if we have relevant documents
-    if not state.retrieved_docs:
-        retrieved_docs = f"No documents currently available for the question: '{user_question}'. You MUST use retrieve_documents tool immediately with a search query based on this question."
-    else:
+    user_question = get_latest_user_question(state)
+    tool_rounds = _tool_rounds_this_turn(state)
+    can_use_tools = tool_rounds < MAX_TOOL_ROUNDS
+
+    if state.retrieved_docs:
         retrieved_docs = format_docs_safe(state.retrieved_docs)
-    
-    # Create a tool-enabled model
-    model = load_chat_model(configuration.response_model).bind_tools(tools)
-    
-    prompt = ChatPromptTemplate.from_template(prompts.SCIENCE_AGENT_PROMPT)
-    
-    message_value = await prompt.ainvoke({
-        "retrieved_docs": retrieved_docs,
-        "question": user_question,
-        "critique_feedback": state.critique_feedback or "None"
-    }, config)
-    
-    response = await model.ainvoke(message_value, config)
-    
-    # Store agent response content for critique
-    agent_response_content = response.content if response.content else ""
-    
-    return {
-        "messages": [response],
-        "agent_response": agent_response_content
-    }
-
-
-async def history_agent(
-    state: State, *, config: RunnableConfig
-) -> dict:
-    """History subject specialist agent."""
-    configuration = Configuration.from_runnable_config(config)
-    
-    user_question = get_original_user_question(state)
-    
-    # Check if we have relevant documents
-    if not state.retrieved_docs:
-        retrieved_docs = f"No documents currently available for the question: '{user_question}'. You MUST use retrieve_documents tool immediately with a search query based on this question."
+    elif tool_rounds == 0:
+        retrieved_docs = (
+            f"No documents currently available for the question: '{user_question}'. "
+            "You MUST use retrieve_documents tool immediately with a search query "
+            "based on this question."
+        )
     else:
-        retrieved_docs = format_docs_safe(state.retrieved_docs)
-    
-    # Create a tool-enabled model
-    model = load_chat_model(configuration.response_model).bind_tools(tools)
-    
-    prompt = ChatPromptTemplate.from_template(prompts.HISTORY_AGENT_PROMPT)
-    
-    message_value = await prompt.ainvoke({
-        "retrieved_docs": retrieved_docs,
-        "question": user_question,
-        "critique_feedback": state.critique_feedback or "None"
-    }, config)
-    
+        # A search already ran this turn and found nothing. Repeating "you MUST
+        # retrieve" here is what used to loop forever.
+        retrieved_docs = (
+            "The knowledge base search found no relevant documents for the "
+            f"question: '{user_question}'. Do not search the knowledge base again; "
+            "answer from your own knowledge and say so when you are unsure."
+        )
+    if not can_use_tools:
+        retrieved_docs += (
+            "\n\nTools are no longer available for this question: write your final "
+            "answer now."
+        )
+
+    chat_model = load_chat_model(configuration.response_model)
+    model: Runnable[Any, BaseMessage] = chat_model
+    if can_use_tools:
+        model = chat_model.bind_tools(
+            tools if configuration.enable_web_search else [retrieve_documents]
+        )
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    message_value = await prompt.ainvoke(
+        {
+            "retrieved_docs": retrieved_docs,
+            "question": user_question,
+            "critique_feedback": state.critique_feedback or "None",
+        },
+        config,
+    )
     response = await model.ainvoke(message_value, config)
-    
-    # Store agent response content for critique
-    agent_response_content = response.content if response.content else ""
-    
-    return {
-        "messages": [response],
-        "agent_response": agent_response_content
-    }
+
+    # Store the answer text for the critique agent. `get_message_text` also handles
+    # providers (e.g. Anthropic) that return a list of content blocks.
+    return {"messages": [response], "agent_response": get_message_text(response)}
 
 
-async def literature_agent(
-    state: State, *, config: RunnableConfig
-) -> dict:
-    """Literature subject specialist agent."""
-    configuration = Configuration.from_runnable_config(config)
-    
-    user_question = get_original_user_question(state)
-    
-    # Check if we have relevant documents
-    if not state.retrieved_docs:
-        retrieved_docs = f"No documents currently available for the question: '{user_question}'. You MUST use retrieve_documents tool immediately with a search query based on this question."
-    else:
-        retrieved_docs = format_docs_safe(state.retrieved_docs)
-    
-    # Create a tool-enabled model
-    model = load_chat_model(configuration.response_model).bind_tools(tools)
-    
-    prompt = ChatPromptTemplate.from_template(prompts.LITERATURE_AGENT_PROMPT)
-    
-    message_value = await prompt.ainvoke({
-        "retrieved_docs": retrieved_docs,
-        "question": user_question,
-        "critique_feedback": state.critique_feedback or "None"
-    }, config)
-    
-    response = await model.ainvoke(message_value, config)
-    
-    # Store agent response content for critique
-    agent_response_content = response.content if response.content else ""
-    
-    return {
-        "messages": [response],
-        "agent_response": agent_response_content
-    }
+def _make_specialist(
+    prompt_template: str, description: str
+) -> Callable[..., Awaitable[NodeUpdate]]:
+    """Create a specialist agent node bound to one subject prompt."""
+
+    async def specialist(state: State, config: RunnableConfig) -> NodeUpdate:
+        return await _run_specialist(state, config, prompt_template)
+
+    specialist.__doc__ = description
+    return specialist
 
 
-async def general_agent(
-    state: State, *, config: RunnableConfig
-) -> dict:
-    """General knowledge specialist agent."""
-    configuration = Configuration.from_runnable_config(config)
-    
-    user_question = get_original_user_question(state)
-    
-    # Check if we have relevant documents
-    if not state.retrieved_docs:
-        retrieved_docs = f"No documents currently available for the question: '{user_question}'. You MUST use retrieve_documents tool immediately with a search query based on this question."
-    else:
-        retrieved_docs = format_docs_safe(state.retrieved_docs)
-    
-    # Create a tool-enabled model
-    model = load_chat_model(configuration.response_model).bind_tools(tools)
-    
-    prompt = ChatPromptTemplate.from_template(prompts.GENERAL_AGENT_PROMPT)
-    
-    message_value = await prompt.ainvoke({
-        "retrieved_docs": retrieved_docs,
-        "question": user_question,
-        "critique_feedback": state.critique_feedback or "None"
-    }, config)
-    
-    response = await model.ainvoke(message_value, config)
-    
-    # Store agent response content for critique
-    agent_response_content = response.content if response.content else ""
-    
-    return {
-        "messages": [response],
-        "agent_response": agent_response_content
-    }
+_SPECIALIST_NODES = {
+    name: _make_specialist(prompt, description)
+    for name, (_, prompt, description) in SPECIALISTS.items()
+}
+# Module-level names for the built-in specialists (kept for importers).
+science_agent = _SPECIALIST_NODES["science_agent"]
+history_agent = _SPECIALIST_NODES["history_agent"]
+literature_agent = _SPECIALIST_NODES["literature_agent"]
+general_agent = _SPECIALIST_NODES["general_agent"]
 
 
-async def critique_agent(
-    state: State, *, config: RunnableConfig
-) -> dict:
+async def critique_agent(state: State, config: RunnableConfig) -> NodeUpdate:
     """Critique and evaluate the specialist agent's response."""
     configuration = Configuration.from_runnable_config(config)
-    
-    user_question = get_original_user_question(state)
-    retrieved_docs = format_docs_safe(state.retrieved_docs) if state.retrieved_docs else "No documents available."
-    agent_response = state.agent_response or ""
-    
+    user_question = get_latest_user_question(state)
+    retrieved_docs = (
+        format_docs_safe(state.retrieved_docs)
+        if state.retrieved_docs
+        else "No documents available."
+    )
+
     prompt = ChatPromptTemplate.from_template(prompts.CRITIQUE_SYSTEM_PROMPT)
-    model = load_chat_model(configuration.response_model).with_structured_output(CritiqueDecision)
-    
-    message_value = await prompt.ainvoke({
-        "agent_response": agent_response,
-        "user_question": user_question,
-        "retrieved_docs": retrieved_docs
-    }, config)
-    
+    model = load_chat_model(configuration.response_model).with_structured_output(
+        CritiqueDecision
+    )
+    message_value = await prompt.ainvoke(
+        {
+            "agent_response": state.agent_response or "",
+            "user_question": user_question,
+            "retrieved_docs": retrieved_docs,
+        },
+        config,
+    )
     critique = cast(CritiqueDecision, await model.ainvoke(message_value, config))
-    
     return {
         "critique_decision": critique.decision,
-        "critique_feedback": critique.reasoning
+        "critique_feedback": critique.reasoning,
     }
 
 
-# Routing functions
-def should_continue_to_tools(state: State) -> str:
-    """Determine if we should continue to tools or move to critique."""
-    last_message = state.messages[-1]
-    
-    # If the last message has tool calls, go to tools
-    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-        return "tools"
-    
-    # Otherwise, go to critique
-    return "critique_agent"
+async def respond(state: State, config: RunnableConfig) -> dict[str, list[BaseMessage]]:
+    """Generate final response based on specialist agent output."""
+    agent_response = (
+        state.agent_response
+        or "I apologize, but I couldn't generate a proper response."
+    )
+    return {"messages": [AIMessage(content=agent_response)]}
+
+
+######################
+# Routing
+######################
+
+
+def route_to_specialist(state: State) -> str:
+    """Route to the appropriate specialist agent based on classification."""
+    return _SUBJECT_TO_SPECIALIST.get(state.classification or "", DEFAULT_SPECIALIST)
 
 
 def after_tools_routing(state: State) -> str:
-    """Route back to the appropriate specialist agent after tools."""
-    classification = state.classification
-    if classification == "science":
-        return "science_agent"
-    elif classification == "history":
-        return "history_agent"
-    elif classification == "literature":
-        return "literature_agent"
-    else:
-        return "general_agent"
+    """Route back to the specialist that requested the tools."""
+    return route_to_specialist(state)
 
 
-async def respond(
-    state: State, *, config: RunnableConfig
-) -> dict[str, list[BaseMessage]]:
-    """Generate final response based on specialist agent output."""
-    from langchain_core.messages import AIMessage
-    
-    # Use the stored agent response
-    agent_response = state.agent_response or "I apologize, but I couldn't generate a proper response."
-    
-    response = AIMessage(content=agent_response)
-    return {"messages": [response]}
-
-
-# Routing Functions
-def route_to_specialist(state: State) -> str:
-    """Route to the appropriate specialist agent based on classification."""
-    classification = state.classification
-    if classification == "science":
-        return "science_agent"
-    elif classification == "history":
-        return "history_agent"
-    elif classification == "literature":
-        return "literature_agent"
-    else:
-        return "general_agent"
+def should_continue_to_tools(state: State) -> str:
+    """Determine if we should continue to tools or move to critique."""
+    last_message = state.messages[-1]
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        return "tools"
+    return "critique_agent"
 
 
 def critique_router(state: State) -> str:
-    """Route based on critique decision."""
-    decision = getattr(state, 'critique_decision', 'respond')
-    
-    if decision == "respond":
-        return "respond"
-    elif decision == "retry":
-        # Go back to the same specialist agent
+    """Route based on critique decision.
+
+    ``retry`` / ``improve_query`` send the draft back to the same specialist (with
+    the critique feedback) at most ``MAX_CRITIQUE_RETRIES`` times per turn; after
+    that the latest draft is returned to the user.
+    """
+    wants_retry = state.critique_decision in ("retry", "improve_query")
+    if wants_retry and _drafts_this_turn(state) <= MAX_CRITIQUE_RETRIES:
         return route_to_specialist(state)
-    elif decision == "improve_query":
-        # Go back to the same specialist agent for better retrieval
-        return route_to_specialist(state)
-    else:
-        return "respond"
+    return "respond"
 
 
-# Define the graph with simplified tool calling patterns
-builder = StateGraph(State, input=InputState, config_schema=Configuration)
+######################
+# Graph
+######################
 
-# Add all nodes
+# `config_schema` is deprecated in LangGraph 1.x in favour of `context_schema`, but
+# switching changes how callers pass configuration (`configurable` -> `context`),
+# so it is kept until a deliberate migration (see docs/development.md).
+builder = StateGraph(  # type: ignore[call-arg]
+    State, input_schema=InputState, config_schema=Configuration
+)
+
 builder.add_node("classify_query", classify_query)
-builder.add_node("science_agent", science_agent)
-builder.add_node("history_agent", history_agent)
-builder.add_node("literature_agent", literature_agent)
-builder.add_node("general_agent", general_agent)
-builder.add_node("tools", handle_tool_calls)  # Tool execution node
+for _name, _node in _SPECIALIST_NODES.items():
+    builder.add_node(_name, _node)
+builder.add_node("tools", handle_tool_calls)
 builder.add_node("critique_agent", critique_agent)
 builder.add_node("respond", respond)
 
-# Define the flow
-builder.add_edge("__start__", "classify_query")
+_to_specialist: dict[Hashable, str] = {name: name for name in SPECIALISTS}
+_to_tools_or_critique: dict[Hashable, str] = {
+    "tools": "tools",
+    "critique_agent": "critique_agent",
+}
+_from_critique: dict[Hashable, str] = {"respond": "respond", **_to_specialist}
 
-# Route to specialist agents after classification
-builder.add_conditional_edges(
-    "classify_query",
-    route_to_specialist,
-    {
-        "science_agent": "science_agent",
-        "history_agent": "history_agent", 
-        "literature_agent": "literature_agent",
-        "general_agent": "general_agent"
-    }
-)
+builder.add_edge(START, "classify_query")
+builder.add_conditional_edges("classify_query", route_to_specialist, _to_specialist)
+for _name in SPECIALISTS:
+    builder.add_conditional_edges(
+        _name, should_continue_to_tools, _to_tools_or_critique
+    )
+builder.add_conditional_edges("tools", after_tools_routing, _to_specialist)
+builder.add_conditional_edges("critique_agent", critique_router, _from_critique)
+builder.add_edge("respond", END)
 
-# From each specialist agent, check if tools need to be called
-builder.add_conditional_edges(
-    "science_agent",
-    should_continue_to_tools,
-    {
-        "tools": "tools",
-        "critique_agent": "critique_agent"
-    }
-)
-
-builder.add_conditional_edges(
-    "history_agent",
-    should_continue_to_tools,
-    {
-        "tools": "tools",
-        "critique_agent": "critique_agent"
-    }
-)
-
-builder.add_conditional_edges(
-    "literature_agent",
-    should_continue_to_tools,
-    {
-        "tools": "tools",
-        "critique_agent": "critique_agent"
-    }
-)
-
-builder.add_conditional_edges(
-    "general_agent",
-    should_continue_to_tools,
-    {
-        "tools": "tools",
-        "critique_agent": "critique_agent"
-    }
-)
-
-# After tools, route back to the appropriate specialist agent
-builder.add_conditional_edges(
-    "tools",
-    after_tools_routing,
-    {
-        "science_agent": "science_agent",
-        "history_agent": "history_agent",
-        "literature_agent": "literature_agent",
-        "general_agent": "general_agent"
-    }
-)
-
-# Critique routing - can retry or respond
-builder.add_conditional_edges(
-    "critique_agent",
-    critique_router,
-    {
-        "respond": "respond",
-        "science_agent": "science_agent",
-        "history_agent": "history_agent", 
-        "literature_agent": "literature_agent",
-        "general_agent": "general_agent"
-    }
-)
-
-# Finally, we compile it!
-graph = builder.compile(
-    interrupt_before=[],
-    interrupt_after=[],
-)
+graph = builder.compile()
 graph.name = "RetrievalGraph"

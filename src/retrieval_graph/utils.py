@@ -1,47 +1,47 @@
 """Utility functions for the retrieval graph.
 
-This module contains utility functions for handling messages, documents,
-and other common operations in project.
-
 Functions:
     get_message_text: Extract text content from various message formats.
-    format_docs: Convert documents to an xml-formatted string with content limits.
+    format_docs: Convert documents to an XML-formatted string with content limits.
+    format_docs_safe: Like ``format_docs`` but bounded by an estimated token budget.
+    format_docs_with_citations: Format documents with title/source/type attributes.
     estimate_tokens: Estimate token count for text (rough approximation).
     truncate_to_token_limit: Truncate text to stay within token limits.
+    load_chat_model: Create a chat model from a ``provider/model`` string.
+    create_documents_from_urls: Download web pages / PDFs and extract their text.
 """
 
+import asyncio
+import io
 import logging
-from typing import List
+from collections.abc import Mapping
+from typing import Any
+from urllib.parse import urlparse
 
+import aiohttp
+import pypdf
+from bs4 import BeautifulSoup
 from langchain.chat_models import init_chat_model
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import BaseMessage
 
-# Optional imports for document processing
-try:
-    import asyncio
-    import io
-    from urllib.parse import urlparse
+logger = logging.getLogger(__name__)
 
-    import aiohttp
-    import PyPDF2
-
-    DOCUMENT_PROCESSING_AVAILABLE = True
-except ImportError:
-    DOCUMENT_PROCESSING_AVAILABLE = False
+URL_FETCH_TIMEOUT_SECONDS = 60
+"""Total time allowed to download one URL before giving up."""
 
 
 def estimate_tokens(text: str) -> int:
     """Estimate the number of tokens in a text string.
-    
+
     This is a rough approximation: 1 token ≈ 4 characters for English text.
-    
+
     Args:
-        text (str): The text to estimate tokens for.
-        
+        text: The text to estimate tokens for.
+
     Returns:
-        int: Estimated number of tokens.
+        Estimated number of tokens.
     """
     if not text:
         return 0
@@ -50,168 +50,161 @@ def estimate_tokens(text: str) -> int:
 
 def truncate_to_token_limit(text: str, max_tokens: int = 150000) -> str:
     """Truncate text to stay within a token limit.
-    
+
     Args:
-        text (str): The text to truncate.
-        max_tokens (int): Maximum number of tokens allowed (default: 150000).
-        
+        text: The text to truncate.
+        max_tokens: Maximum number of tokens allowed (default: 150000).
+
     Returns:
-        str: Truncated text that should be within the token limit.
+        Truncated text that should be within the token limit.
     """
     if not text:
         return text
-        
-    estimated_tokens = estimate_tokens(text)
-    if estimated_tokens <= max_tokens:
+
+    if estimate_tokens(text) <= max_tokens:
         return text
-    
+
     # Calculate how much to truncate (with some safety margin)
     target_chars = max_tokens * 4 * 0.9  # 90% of estimated limit for safety
     if len(text) > target_chars:
-        truncated = text[:int(target_chars)]
+        truncated = text[: int(target_chars)]
         return truncated + "\n\n... [CONTENT TRUNCATED TO PREVENT TOKEN OVERFLOW]"
-    
+
     return text
 
 
-def get_message_text(msg: AnyMessage) -> str:
+def get_message_text(msg: BaseMessage) -> str:
     """Get the text content of a message.
 
-    This function extracts the text content from various message formats.
+    Handles both plain string content and lists of content blocks (as returned by
+    some providers, e.g. Anthropic); non-text blocks such as tool calls are skipped.
 
     Args:
-        msg (AnyMessage): The message object to extract text from.
+        msg: The message object to extract text from.
 
     Returns:
-        str: The extracted text content of the message.
+        The extracted text content of the message.
 
     Examples:
         >>> from langchain_core.messages import HumanMessage
         >>> get_message_text(HumanMessage(content="Hello"))
         'Hello'
-        >>> get_message_text(HumanMessage(content={"text": "World"}))
-        'World'
-        >>> get_message_text(HumanMessage(content=[{"text": "Hello"}, " ", {"text": "World"}]))
+        >>> get_message_text(HumanMessage(content=[{"type": "text", "text": "Hello"}, " ", {"type": "text", "text": "World"}]))
         'Hello World'
     """
     content = msg.content
     if isinstance(content, str):
         return content
-    elif isinstance(content, dict):
-        return content.get("text", "")
-    else:
-        txts = [c if isinstance(c, str) else (c.get("text") or "") for c in content]
-        return "".join(txts).strip()
+    texts = [c if isinstance(c, str) else str(c.get("text") or "") for c in content]
+    return "".join(texts).strip()
+
+
+def _format_metadata(metadata: Mapping[str, Any] | None) -> str:
+    """Render metadata as XML-ish attributes for a ``<document>`` tag."""
+    meta = "".join(f" {k}={v!r}" for k, v in (metadata or {}).items())
+    return f" {meta}" if meta else ""
 
 
 def _format_doc(doc: Document, max_content_length: int = 2000) -> str:
     """Format a single document as XML with content truncation.
 
     Args:
-        doc (Document): The document to format.
-        max_content_length (int): Maximum length of content to include (default: 2000 chars).
+        doc: The document to format.
+        max_content_length: Maximum length of content to include (default: 2000 chars).
 
     Returns:
-        str: The formatted document as an XML string.
+        The formatted document as an XML string.
     """
-    metadata = doc.metadata or {}
-    meta = "".join(f" {k}={v!r}" for k, v in metadata.items())
-    if meta:
-        meta = f" {meta}"
-
-    # Truncate content if it's too long
     content = doc.page_content
     if len(content) > max_content_length:
         content = content[:max_content_length] + "... [TRUNCATED]"
-
-    return f"<document{meta}>\n{content}\n</document>"
+    return f"<document{_format_metadata(doc.metadata)}>\n{content}\n</document>"
 
 
 def format_docs_safe(docs: list[Document] | None, max_total_tokens: int = 50000) -> str:
     """Format documents with intelligent token-based truncation.
-    
+
     This function formats documents while staying within token limits by:
     1. Limiting the number of documents
     2. Truncating individual document content
     3. Monitoring total token usage
-    
+
     Args:
-        docs (Optional[list[Document]]): Documents to format.
-        max_total_tokens (int): Maximum total tokens for all documents (default: 50000).
-        
+        docs: Documents to format.
+        max_total_tokens: Maximum total tokens for all documents (default: 50000).
+
     Returns:
-        str: Formatted documents within token limits.
+        Formatted documents within token limits.
     """
     if not docs:
         return "<documents></documents>"
-    
+
     formatted_docs = []
     total_tokens = 0
     max_doc_tokens = 8000  # Max tokens per document
-    
+
     for i, doc in enumerate(docs):
         # Truncate individual document content to prevent any single doc from being too large
         content = doc.page_content
         doc_tokens = estimate_tokens(content)
-        
+
         if doc_tokens > max_doc_tokens:
-            # Truncate this document
             target_chars = max_doc_tokens * 4 * 0.9
-            content = content[:int(target_chars)] + "... [DOCUMENT TRUNCATED]"
+            content = content[: int(target_chars)] + "... [DOCUMENT TRUNCATED]"
             doc_tokens = estimate_tokens(content)
-        
+
         # Check if adding this document would exceed our total limit
         if total_tokens + doc_tokens > max_total_tokens:
             if i == 0:
                 # If even the first document would exceed limits, truncate it more aggressively
                 remaining_tokens = max_total_tokens - 1000  # Leave room for XML markup
                 target_chars = remaining_tokens * 4 * 0.9
-                content = doc.page_content[:int(target_chars)] + "... [HEAVILY TRUNCATED DUE TO SIZE]"
+                content = (
+                    doc.page_content[: int(target_chars)]
+                    + "... [HEAVILY TRUNCATED DUE TO SIZE]"
+                )
             else:
                 # Stop adding documents, we've reached our limit
                 break
-        
-        # Format this document
-        metadata = doc.metadata or {}
-        meta = "".join(f" {k}={v!r}" for k, v in metadata.items())
-        if meta:
-            meta = f" {meta}"
-        
-        formatted_doc = f"<document{meta}>\n{content}\n</document>"
+
+        formatted_doc = (
+            f"<document{_format_metadata(doc.metadata)}>\n{content}\n</document>"
+        )
         formatted_docs.append(formatted_doc)
         total_tokens += estimate_tokens(formatted_doc)
-    
-    # Create the final result
+
     formatted = "\n".join(formatted_docs)
-    
-    # Add truncation note if needed
+
     truncation_note = ""
     if len(formatted_docs) < len(docs):
         truncation_note = f"\n<!-- Note: Showing {len(formatted_docs)} of {len(docs)} documents (others truncated to prevent token overflow) -->"
-    
+
     result = f"""<documents>
 {formatted}{truncation_note}
 </documents>"""
-    
+
     # Final safety check
     if estimate_tokens(result) > max_total_tokens:
-        # Emergency truncation
         result = truncate_to_token_limit(result, max_total_tokens)
-    
+
     return result
-def format_docs(docs: list[Document] | None, max_content_length: int = 2000, max_total_docs: int = 3) -> str:
+
+
+def format_docs(
+    docs: list[Document] | None, max_content_length: int = 2000, max_total_docs: int = 3
+) -> str:
     """Format a list of documents as XML with content and document limits.
 
     This function takes a list of Document objects and formats them into a single XML string,
     with content truncation and document count limits to prevent token overflow.
 
     Args:
-        docs (Optional[list[Document]]): A list of Document objects to format, or None.
-        max_content_length (int): Maximum length of content per document (default: 2000 chars).
-        max_total_docs (int): Maximum number of documents to include (default: 3).
+        docs: A list of Document objects to format, or None.
+        max_content_length: Maximum length of content per document (default: 2000 chars).
+        max_total_docs: Maximum number of documents to include (default: 3).
 
     Returns:
-        str: A string containing the formatted documents in XML format.
+        A string containing the formatted documents in XML format.
 
     Examples:
         >>> docs = [Document(page_content="Hello"), Document(page_content="World")]
@@ -230,208 +223,27 @@ def format_docs(docs: list[Document] | None, max_content_length: int = 2000, max
     """
     if not docs:
         return "<documents></documents>"
-    
-    # Limit the number of documents to prevent token overflow
+
     limited_docs = docs[:max_total_docs]
-    
     formatted = "\n".join(_format_doc(doc, max_content_length) for doc in limited_docs)
-    
-    # Add a note if we had to truncate documents
+
     truncation_note = ""
     if len(docs) > max_total_docs:
         truncation_note = f"\n<!-- Note: Showing {max_total_docs} of {len(docs)} documents to prevent token overflow -->"
-    
+
     return f"""<documents>
 {formatted}{truncation_note}
 </documents>"""
 
 
-def load_chat_model(fully_specified_name: str) -> BaseChatModel:
-    """Load a chat model from a fully specified name.
-
-    Args:
-        fully_specified_name (str): String in the format 'provider/model'.
-    """
-    if "/" in fully_specified_name:
-        provider, model = fully_specified_name.split("/", maxsplit=1)
-    else:
-        provider = ""
-        model = fully_specified_name
-    return init_chat_model(model, model_provider=provider)
-
-
-async def extract_text_from_pdf_url(pdf_url: str) -> str:
-    """Extract text content from a PDF URL.
-
-    Args:
-        pdf_url (str): URL pointing to a PDF file.
-
-    Returns:
-        str: Extracted text content from the PDF.
-    """
-    if not DOCUMENT_PROCESSING_AVAILABLE:
-        return "Document processing dependencies not available. Please install: pip install aiohttp PyPDF2"
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(pdf_url) as response:
-                if response.status == 200:
-                    pdf_content = await response.read()
-                    pdf_file = io.BytesIO(pdf_content)
-                    pdf_reader = PyPDF2.PdfReader(pdf_file)
-
-                    text = ""
-                    for page in pdf_reader.pages:
-                        text += page.extract_text() + "\n"
-
-                    return text.strip()
-                else:
-                    return f"Failed to download PDF: HTTP {response.status}"
-    except Exception as e:
-        return f"Error processing PDF: {str(e)}"
-
-
-async def extract_text_from_web_url(web_url: str) -> str:
-    """Extract text content from a web URL.
-
-    Args:
-        web_url (str): URL pointing to a web page.
-
-    Returns:
-        str: Extracted text content from the web page.
-    """
-    if not DOCUMENT_PROCESSING_AVAILABLE:
-        return "Document processing dependencies not available. Please install: pip install aiohttp beautifulsoup4"
-
-    try:
-        from bs4 import BeautifulSoup
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(web_url) as response:
-                if response.status == 200:
-                    html_content = await response.text()
-                    soup = BeautifulSoup(html_content, "html.parser")
-
-                    # Remove script and style elements
-                    for script in soup(["script", "style"]):
-                        script.decompose()
-
-                    # Extract text
-                    text = soup.get_text()
-
-                    # Clean up whitespace
-                    lines = (line.strip() for line in text.splitlines())
-                    chunks = (
-                        phrase.strip() for line in lines for phrase in line.split("  ")
-                    )
-                    text = " ".join(chunk for chunk in chunks if chunk)
-
-                    return text
-                else:
-                    return f"Failed to access URL: HTTP {response.status}"
-    except ImportError:
-        return "BeautifulSoup not available. Please install with: pip install beautifulsoup4"
-    except Exception as e:
-        return f"Error processing web page: {str(e)}"
-
-
-async def create_documents_from_urls(urls: List[str]) -> List[Document]:
-    """Create Document objects from a list of URLs with enhanced error handling and content validation.
-
-    Args:
-        urls (List[str]): List of URLs to process.
-
-    Returns:
-        List[Document]: List of Document objects with extracted content or error information.
-    """
-    if not DOCUMENT_PROCESSING_AVAILABLE:
-        logging.warning(
-            "Document processing dependencies not available. Please install: pip install aiohttp PyPDF2 beautifulsoup4"
-        )
-        # Return documents with error information instead of empty list
-        return [
-            Document(
-                page_content="Document processing dependencies not available. Please install: pip install aiohttp PyPDF2 beautifulsoup4",
-                metadata={"source": url, "type": "error", "title": "Dependency Error", "extraction_success": False}
-            ) for url in urls
-        ]
-
-    documents = []
-
-    async def process_url(url: str) -> Document:
-        """Process a single URL and always return a Document (with error info if needed)."""
-        try:
-            parsed_url = urlparse(url)
-            if parsed_url.path.lower().endswith(".pdf"):
-                content = await extract_text_from_pdf_url(url)
-                doc_type = "pdf"
-            else:
-                content = await extract_text_from_web_url(url)
-                doc_type = "webpage"
-
-            # Determine if extraction was successful
-            extraction_success = not (
-                content.startswith(("Failed", "Error", "Document processing dependencies")) or
-                content == url or
-                len(content.strip()) < 100
-            )
-
-            return Document(
-                page_content=content,
-                metadata={
-                    "source": url,
-                    "type": doc_type,
-                    "title": parsed_url.path.split("/")[-1] or parsed_url.netloc,
-                    "extraction_success": extraction_success,
-                    "content_length": len(content.strip())
-                },
-            )
-        except Exception as e:
-            logging.error("Error processing %s: %s", url, str(e))
-            return Document(
-                page_content=f"Error processing URL: {str(e)}",
-                metadata={
-                    "source": url,
-                    "type": "error",
-                    "title": "Processing Error",
-                    "extraction_success": False,
-                    "content_length": 0
-                },
-            )
-
-    # Process all URLs concurrently using gather
-    tasks = [process_url(url) for url in urls]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for i, result in enumerate(results):
-        if isinstance(result, Document):
-            documents.append(result)
-        elif isinstance(result, Exception):
-            # Handle exceptions that weren't caught in process_url
-            source_url = urls[i] if i < len(urls) else "Unknown"
-            documents.append(
-                Document(
-                    page_content=f"Exception during processing: {str(result)}",
-                    metadata={
-                        "source": source_url,
-                        "type": "error",
-                        "title": "Processing Exception",
-                        "extraction_success": False,
-                        "content_length": 0
-                    },
-                )
-            )
-
-    return documents
-
-def format_docs_with_citations(docs: list | Document) -> str:
+def format_docs_with_citations(docs: list[Document] | None) -> str:
     """Format documents with enhanced citation information.
 
     Args:
-        docs (Optional[list[Document]]): Documents to format.
+        docs: Documents to format.
 
     Returns:
-        str: Formatted documents with citation metadata.
+        Formatted documents with citation metadata.
     """
     if not docs:
         return "<documents></documents>"
@@ -446,6 +258,175 @@ def format_docs_with_citations(docs: list | Document) -> str:
         citation_info = f'title="{title}" source="{source}" type="{doc_type}"'
         formatted.append(f"<document {citation_info}>\n{doc.page_content}\n</document>")
 
-    return f"""<documents>
-{chr(10).join(formatted)}
-</documents>"""
+    body = "\n".join(formatted)
+    return f"<documents>\n{body}\n</documents>"
+
+
+def load_chat_model(fully_specified_name: str) -> BaseChatModel:
+    """Load a chat model from a fully specified name.
+
+    Args:
+        fully_specified_name: String in the format 'provider/model'. Without a
+            provider prefix, LangChain infers the provider from the model name.
+    """
+    if "/" in fully_specified_name:
+        provider, model = fully_specified_name.split("/", maxsplit=1)
+    else:
+        provider, model = "", fully_specified_name
+    return init_chat_model(model, model_provider=provider or None)
+
+
+######################
+# URL ingestion
+######################
+
+
+def _pdf_bytes_to_text(data: bytes) -> str:
+    reader = pypdf.PdfReader(io.BytesIO(data))
+    return "".join(page.extract_text() + "\n" for page in reader.pages).strip()
+
+
+def _html_to_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for element in soup(["script", "style"]):
+        element.decompose()
+    lines = (line.strip() for line in soup.get_text().splitlines())
+    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+    return " ".join(chunk for chunk in chunks if chunk)
+
+
+def _client_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(total=URL_FETCH_TIMEOUT_SECONDS)
+
+
+async def extract_text_from_pdf_url(pdf_url: str) -> str:
+    """Extract text content from a PDF URL.
+
+    Args:
+        pdf_url: URL pointing to a PDF file.
+
+    Returns:
+        Extracted text content from the PDF, or a message starting with "Failed"
+        or "Error" describing what went wrong.
+    """
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=_client_timeout()) as session,
+            session.get(pdf_url) as response,
+        ):
+            if response.status != 200:
+                return f"Failed to download PDF: HTTP {response.status}"
+            pdf_content = await response.read()
+        # Parsing is CPU-bound; keep it off the event loop.
+        return await asyncio.to_thread(_pdf_bytes_to_text, pdf_content)
+    except TimeoutError:
+        return f"Error processing PDF: timed out after {URL_FETCH_TIMEOUT_SECONDS}s"
+    except Exception as e:
+        return f"Error processing PDF: {e!s}"
+
+
+async def extract_text_from_web_url(web_url: str) -> str:
+    """Extract text content from a web URL.
+
+    Args:
+        web_url: URL pointing to a web page.
+
+    Returns:
+        Extracted text content from the web page, or a message starting with
+        "Failed" or "Error" describing what went wrong.
+    """
+    try:
+        async with (
+            aiohttp.ClientSession(timeout=_client_timeout()) as session,
+            session.get(web_url) as response,
+        ):
+            if response.status != 200:
+                return f"Failed to access URL: HTTP {response.status}"
+            html_content = await response.text()
+        return await asyncio.to_thread(_html_to_text, html_content)
+    except TimeoutError:
+        return (
+            f"Error processing web page: timed out after {URL_FETCH_TIMEOUT_SECONDS}s"
+        )
+    except Exception as e:
+        return f"Error processing web page: {e!s}"
+
+
+def _error_document(url: str, content: str, title: str) -> Document:
+    return Document(
+        page_content=content,
+        metadata={
+            "source": url,
+            "type": "error",
+            "title": title,
+            "extraction_success": False,
+            "content_length": 0,
+        },
+    )
+
+
+async def create_documents_from_urls(urls: list[str]) -> list[Document]:
+    """Create Document objects from a list of URLs with content validation.
+
+    URLs are fetched concurrently. URLs whose path ends in ``.pdf`` are parsed as
+    PDFs, everything else as HTML. One document is returned per URL, in order; a
+    failed URL yields a document whose ``metadata["extraction_success"]`` is False.
+
+    Args:
+        urls: List of URLs to process.
+
+    Returns:
+        List of Document objects with extracted content or error information.
+    """
+
+    async def process_url(url: str) -> Document:
+        """Process a single URL and always return a Document (with error info if needed)."""
+        try:
+            parsed_url = urlparse(url)
+            if parsed_url.path.lower().endswith(".pdf"):
+                content = await extract_text_from_pdf_url(url)
+                doc_type = "pdf"
+            else:
+                content = await extract_text_from_web_url(url)
+                doc_type = "webpage"
+
+            extraction_success = not (
+                content.startswith(
+                    ("Failed", "Error", "Document processing dependencies")
+                )
+                or content == url
+                or len(content.strip()) < 100
+            )
+            return Document(
+                page_content=content,
+                metadata={
+                    "source": url,
+                    "type": doc_type,
+                    "title": parsed_url.path.split("/")[-1] or parsed_url.netloc,
+                    "extraction_success": extraction_success,
+                    "content_length": len(content.strip()),
+                },
+            )
+        except Exception as e:
+            logger.error("Error processing %s: %s", url, e)
+            return _error_document(
+                url, f"Error processing URL: {e!s}", "Processing Error"
+            )
+
+    results = await asyncio.gather(
+        *(process_url(url) for url in urls), return_exceptions=True
+    )
+
+    documents = []
+    for url, result in zip(urls, results, strict=True):
+        if isinstance(result, Document):
+            documents.append(result)
+        else:  # Exceptions that escaped process_url (e.g. cancellation).
+            documents.append(
+                _error_document(
+                    url,
+                    f"Exception during processing: {result!s}",
+                    "Processing Exception",
+                )
+            )
+    return documents
