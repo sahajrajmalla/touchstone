@@ -19,13 +19,13 @@ To add a specialist, add a prompt in :mod:`retrieval_graph.prompts`, register it
 ``SPECIALISTS`` below and extend the ``subject`` literal in ``QueryClassification``.
 """
 
-from collections.abc import Awaitable, Callable, Hashable
+from collections.abc import Awaitable, Callable, Hashable, Sequence
 from typing import Any, Literal, cast
 
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
@@ -81,25 +81,66 @@ _SUBJECT_TO_SPECIALIST = {
     subject: node for node, (subject, _, _) in SPECIALISTS.items()
 }
 
+# Loop guards. Without them an empty knowledge base, a failing search, or a critic
+# that keeps asking for retries makes the run loop until LangGraph aborts it with a
+# GraphRecursionError, and the user gets no answer at all.
+MAX_TOOL_ROUNDS = 3
+"""Tool rounds a specialist may request per user turn before it must answer."""
+MAX_CRITIQUE_RETRIES = 2
+"""Times the critic may send a draft back per user turn before it is accepted."""
 
-def get_original_user_question(state: State) -> str:
-    """Extract the original user question from the message history."""
-    # Look for the first human message
-    for msg in state.messages:
+
+######################
+# Turn helpers
+######################
+
+
+def _current_turn(messages: Sequence[AnyMessage]) -> Sequence[AnyMessage]:
+    """Return the messages produced after the latest human message."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].type == "human":
+            return messages[i + 1 :]
+    return messages
+
+
+def _tool_rounds_this_turn(state: State) -> int:
+    """Count the specialist messages that requested tools during this turn."""
+    return sum(
+        1
+        for msg in _current_turn(state.messages)
+        if isinstance(msg, AIMessage) and msg.tool_calls
+    )
+
+
+def _drafts_this_turn(state: State) -> int:
+    """Count the specialist answers (messages without tool calls) this turn."""
+    return sum(
+        1
+        for msg in _current_turn(state.messages)
+        if isinstance(msg, AIMessage) and not msg.tool_calls
+    )
+
+
+def get_latest_user_question(state: State) -> str:
+    """Return the text of the latest human message (the question of this turn).
+
+    Falls back to the first message if the history contains no human message.
+    """
+    for msg in reversed(state.messages):
         if msg.type == "human":
             return get_message_text(msg)
-
-    # Fallback to first message if no human message found
-    if state.messages:
-        return get_message_text(state.messages[0])
-
-    return ""
+    return get_message_text(state.messages[0]) if state.messages else ""
 
 
 async def classify_query(state: State, config: RunnableConfig) -> NodeUpdate:
-    """Classify the user's query into subject areas."""
+    """Classify the user's query into subject areas.
+
+    This is the first node of every turn, so it also clears the per-turn fields:
+    in a persistent thread (LangGraph Studio, the Touchstone UI) the previous
+    question's documents and critique would otherwise leak into this one.
+    """
     configuration = Configuration.from_runnable_config(config)
-    user_question = get_original_user_question(state)
+    user_question = get_latest_user_question(state)
 
     prompt = ChatPromptTemplate.from_template(prompts.CLASSIFICATION_SYSTEM_PROMPT)
     model = load_chat_model(configuration.query_model).with_structured_output(
@@ -110,7 +151,13 @@ async def classify_query(state: State, config: RunnableConfig) -> NodeUpdate:
     classification = cast(
         QueryClassification, await model.ainvoke(message_value, config)
     )
-    return {"classification": classification.subject}
+    return {
+        "classification": classification.subject,
+        "retrieved_docs": [],
+        "agent_response": None,
+        "critique_decision": None,
+        "critique_feedback": None,
+    }
 
 
 ######################
@@ -164,7 +211,7 @@ async def _run_retrieval(
 ) -> tuple[str, list[Document]]:
     """Search the knowledge base; return the tool message text and new documents."""
     try:
-        with retrieval.make_retriever(config) as retriever:
+        async with retrieval.make_retriever(config) as retriever:
             docs = await retriever.ainvoke(query, config)
     except Exception as e:
         return f"Error during retrieval: {e!s}", []
@@ -200,11 +247,28 @@ async def _run_web_search(
     query: str, config: RunnableConfig
 ) -> tuple[str, list[Document]]:
     """Search the web with Tavily; return the tool message text and new documents."""
+    configuration = Configuration.from_runnable_config(config)
+    if not configuration.enable_web_search:
+        return "Web search is disabled in the configuration.", []
+
     try:
         from langchain_community.tools import TavilySearchResults
+        from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
 
-        search_tool = TavilySearchResults(max_results=WEB_SEARCH_MAX_RESULTS)
-        search_results = search_tool.invoke({"query": query})
+        if configuration.web_search_api_key:
+            search_tool = TavilySearchResults(
+                max_results=WEB_SEARCH_MAX_RESULTS,
+                api_wrapper=TavilySearchAPIWrapper(
+                    tavily_api_key=configuration.web_search_api_key  # type: ignore[arg-type]
+                ),
+            )
+        else:  # The wrapper falls back to the TAVILY_API_KEY environment variable.
+            search_tool = TavilySearchResults(max_results=WEB_SEARCH_MAX_RESULTS)
+        # Async call: a sync HTTP request would block the event loop (and is
+        # rejected by `langgraph dev`).
+        search_results = await search_tool.ainvoke({"query": query})
+        if isinstance(search_results, str):  # The tool reports failures as text.
+            return f"Error during web search: {search_results}", []
 
         web_docs = []
         for result in search_results:
@@ -279,18 +343,38 @@ async def _run_specialist(
 ) -> NodeUpdate:
     """Answer the user's question with a subject-specific prompt and tools."""
     configuration = Configuration.from_runnable_config(config)
-    user_question = get_original_user_question(state)
+    user_question = get_latest_user_question(state)
+    tool_rounds = _tool_rounds_this_turn(state)
+    can_use_tools = tool_rounds < MAX_TOOL_ROUNDS
 
-    if not state.retrieved_docs:
+    if state.retrieved_docs:
+        retrieved_docs = format_docs_safe(state.retrieved_docs)
+    elif tool_rounds == 0:
         retrieved_docs = (
             f"No documents currently available for the question: '{user_question}'. "
             "You MUST use retrieve_documents tool immediately with a search query "
             "based on this question."
         )
     else:
-        retrieved_docs = format_docs_safe(state.retrieved_docs)
+        # A search already ran this turn and found nothing. Repeating "you MUST
+        # retrieve" here is what used to loop forever.
+        retrieved_docs = (
+            "The knowledge base search found no relevant documents for the "
+            f"question: '{user_question}'. Do not search the knowledge base again; "
+            "answer from your own knowledge and say so when you are unsure."
+        )
+    if not can_use_tools:
+        retrieved_docs += (
+            "\n\nTools are no longer available for this question: write your final "
+            "answer now."
+        )
 
-    model = load_chat_model(configuration.response_model).bind_tools(tools)
+    chat_model = load_chat_model(configuration.response_model)
+    model: Runnable[Any, BaseMessage] = chat_model
+    if can_use_tools:
+        model = chat_model.bind_tools(
+            tools if configuration.enable_web_search else [retrieve_documents]
+        )
     prompt = ChatPromptTemplate.from_template(prompt_template)
     message_value = await prompt.ainvoke(
         {
@@ -302,11 +386,9 @@ async def _run_specialist(
     )
     response = await model.ainvoke(message_value, config)
 
-    # Store the agent response content for the critique agent.
-    return {
-        "messages": [response],
-        "agent_response": response.content if response.content else "",
-    }
+    # Store the answer text for the critique agent. `get_message_text` also handles
+    # providers (e.g. Anthropic) that return a list of content blocks.
+    return {"messages": [response], "agent_response": get_message_text(response)}
 
 
 def _make_specialist(
@@ -336,7 +418,7 @@ _SPECIALIST_NODES = {
 async def critique_agent(state: State, config: RunnableConfig) -> NodeUpdate:
     """Critique and evaluate the specialist agent's response."""
     configuration = Configuration.from_runnable_config(config)
-    user_question = get_original_user_question(state)
+    user_question = get_latest_user_question(state)
     retrieved_docs = (
         format_docs_safe(state.retrieved_docs)
         if state.retrieved_docs
@@ -395,9 +477,14 @@ def should_continue_to_tools(state: State) -> str:
 
 
 def critique_router(state: State) -> str:
-    """Route based on critique decision."""
-    if state.critique_decision in ("retry", "improve_query"):
-        # Go back to the same specialist agent (with the critique feedback).
+    """Route based on critique decision.
+
+    ``retry`` / ``improve_query`` send the draft back to the same specialist (with
+    the critique feedback) at most ``MAX_CRITIQUE_RETRIES`` times per turn; after
+    that the latest draft is returned to the user.
+    """
+    wants_retry = state.critique_decision in ("retry", "improve_query")
+    if wants_retry and _drafts_this_turn(state) <= MAX_CRITIQUE_RETRIES:
         return route_to_specialist(state)
     return "respond"
 

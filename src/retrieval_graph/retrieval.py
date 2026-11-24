@@ -1,38 +1,53 @@
-"""Manage the configuration of various retrievers.
+"""Create retrievers for the configured vector store.
 
-This module provides functionality to create and manage retrievers for different
-vector store backends, specifically Elasticsearch, Pinecone, and MongoDB.
+Only a local Elasticsearch deployment (``retriever_provider="elastic-local"``) is
+currently supported. Every search is filtered by ``user_id`` so that each user only
+sees the documents they indexed.
 
-The retrievers support filtering results by user_id to ensure data isolation between users.
+Usage::
+
+    async with make_retriever(config) as retriever:
+        docs = await retriever.ainvoke("photosynthesis")
 """
 
+import logging
 import os
-import asyncio
-from contextlib import contextmanager
-from typing import Generator
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING
 
 from langchain_core.embeddings import Embeddings
 from langchain_core.runnables import RunnableConfig
 from langchain_core.vectorstores import VectorStoreRetriever
 
-from retrieval_graph.configuration import Configuration, IndexConfiguration
+from retrieval_graph.configuration import IndexConfiguration
 
-## Encoder constructors
+if TYPE_CHECKING:
+    from elasticsearch import AsyncElasticsearch
+
+logger = logging.getLogger(__name__)
+
+SUPPORTED_RETRIEVER_PROVIDERS = ("elastic-local",)
+ELASTICSEARCH_INDEX_NAME = "langchain_index"
+"""Elasticsearch index that stores every user's documents (filtered by user_id)."""
 
 
 def make_text_encoder(model: str) -> Embeddings:
-    """Connect to the configured text encoder."""
+    """Connect to the configured text encoder.
+
+    Args:
+        model: Embedding model as ``provider/model``. A bare model name is treated
+            as a Google model.
+
+    Raises:
+        ValueError: If ``model`` is empty or the provider is not supported.
+    """
     if not model:
         raise ValueError("Embedding model cannot be empty or None")
-    
-    # Handle cases where model string doesn't contain a provider prefix
-    if "/" not in model:
-        # Default to google provider for models without a provider prefix
-        provider = "google"
-        model_name = model
-    else:
-        provider, model_name = model.split("/", maxsplit=1)
-    
+
+    provider, model_name = (
+        model.split("/", maxsplit=1) if "/" in model else ("google", model)
+    )
     match provider:
         case "google":
             from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -42,119 +57,83 @@ def make_text_encoder(model: str) -> Embeddings:
             raise ValueError(f"Unsupported embedding provider: {provider}")
 
 
-## Retriever constructors
+def _elasticsearch_settings() -> tuple[str, str, str]:
+    """Read the Elasticsearch connection settings from the environment.
+
+    The URL must be non-empty. User and password must be set but may be empty
+    (e.g. for a local cluster with security disabled).
+
+    Raises:
+        ValueError: With the names of the missing variables, if any.
+    """
+    settings = {
+        "ELASTICSEARCH_URL": os.environ.get("ELASTICSEARCH_URL") or None,
+        "ELASTICSEARCH_USER": os.environ.get("ELASTICSEARCH_USER"),
+        "ELASTICSEARCH_PASSWORD": os.environ.get("ELASTICSEARCH_PASSWORD"),
+    }
+    missing = [name for name, value in settings.items() if value is None]
+    if missing:
+        raise ValueError(
+            "Elasticsearch is not configured: set "
+            f"{', '.join(missing)} in your .env file (see .env.example)."
+        )
+    url, user, password = settings.values()
+    return str(url), str(user), str(password)
 
 
-async def _create_async_elastic_retriever(
+def _make_elastic_retriever(
     configuration: IndexConfiguration, embedding_model: Embeddings
-) -> VectorStoreRetriever:
-    """Internal async function to create Elasticsearch retriever."""
-    from langchain_elasticsearch import AsyncElasticsearchStore
+) -> tuple[VectorStoreRetriever, "AsyncElasticsearch"]:
+    """Build a user-scoped Elasticsearch retriever and return it with its client.
+
+    No network I/O happens here; connections are opened lazily on first use.
+    """
     from elasticsearch import AsyncElasticsearch
+    from langchain_elasticsearch import AsyncElasticsearchStore
 
-    connection_options = {}
-    if configuration.retriever_provider == "elastic-local":
-        connection_options = {
-            "basic_auth": (
-                os.environ["ELASTICSEARCH_USER"], 
-                os.environ["ELASTICSEARCH_PASSWORD"]
-            ),
-        }
-    else:
-        connection_options = {"api_key": os.environ["ELASTICSEARCH_API_KEY"]}
-
-    # Create async Elasticsearch client
-    es_client = AsyncElasticsearch(
-        hosts=[os.environ["ELASTICSEARCH_URL"]],
-        **connection_options
-    )
-
-    # Create AsyncElasticsearchStore
-    vstore = AsyncElasticsearchStore(
-        es_connection=es_client,
-        index_name="langchain_index",
+    url, user, password = _elasticsearch_settings()
+    client = AsyncElasticsearch(hosts=[url], basic_auth=(user, password))
+    store = AsyncElasticsearchStore(
+        index_name=ELASTICSEARCH_INDEX_NAME,
         embedding=embedding_model,
+        client=client,
     )
 
-    search_kwargs = configuration.search_kwargs.copy()
-
-    # Add user_id filter for data isolation
-    search_filter = search_kwargs.setdefault("filter", [])
-    search_filter.append({"term": {"metadata.user_id": configuration.user_id}})
-    
-    # Set default k to limit retrieved documents (default to 1 as specified)
-    if "k" not in search_kwargs:
-        search_kwargs["k"] = 1
-    
-    return vstore.as_retriever(search_kwargs=search_kwargs)
+    search_kwargs = dict(configuration.search_kwargs)
+    # Restrict results to this user's documents (data isolation). Build a new list
+    # so the caller's configuration is never mutated.
+    search_kwargs["filter"] = [
+        *search_kwargs.get("filter", []),
+        {"term": {"metadata.user_id": configuration.user_id}},
+    ]
+    search_kwargs.setdefault("k", 1)
+    return store.as_retriever(search_kwargs=search_kwargs), client
 
 
-@contextmanager
-def make_elastic_retriever(
-    configuration: IndexConfiguration, embedding_model: Embeddings
-) -> Generator[VectorStoreRetriever, None, None]:
-    """Configure this agent to connect to a specific elastic index using async operations."""
-    
-    # Run the async creation in a thread to avoid blocking
-    async def create_retriever():
-        return await _create_async_elastic_retriever(configuration, embedding_model)
-    
-    # Use asyncio.to_thread to run the async operation without blocking
-    try:
-        # Get or create event loop
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If we're already in an async context, we need to use a different approach
-            # This creates the retriever using the async method but wraps it for sync use
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, create_retriever())
-                retriever = future.result(timeout=30)
-        else:
-            retriever = loop.run_until_complete(create_retriever())
-    except RuntimeError:
-        # Fallback: create a new event loop
-        retriever = asyncio.run(create_retriever())
-    
+@asynccontextmanager
+async def make_retriever(config: RunnableConfig) -> AsyncIterator[VectorStoreRetriever]:
+    """Create a retriever for the agent, based on the current configuration.
+
+    The underlying Elasticsearch client is closed when the ``async with`` block
+    exits, even if it raises.
+
+    Raises:
+        ValueError: If the configuration or environment is invalid.
+    """
+    configuration = IndexConfiguration.from_runnable_config(config)
+    if configuration.retriever_provider not in SUPPORTED_RETRIEVER_PROVIDERS:
+        raise ValueError(
+            "Unrecognized retriever_provider in configuration. "
+            f"Expected one of: {', '.join(SUPPORTED_RETRIEVER_PROVIDERS)}\n"
+            f"Got: {configuration.retriever_provider}"
+        )
+
+    embedding_model = make_text_encoder(configuration.embedding_model)
+    retriever, client = _make_elastic_retriever(configuration, embedding_model)
     try:
         yield retriever
     finally:
-        # Clean up the retriever's connection if it has one
-        if hasattr(retriever.vectorstore, 'client') and hasattr(retriever.vectorstore.client, 'close'):
-            try:
-                # Try to close the client properly
-                if asyncio.iscoroutinefunction(retriever.vectorstore.client.close):
-                    try:
-                        loop = asyncio.get_event_loop()
-                        if not loop.is_closed():
-                            loop.run_until_complete(retriever.vectorstore.client.close())
-                    except RuntimeError:
-                        asyncio.run(retriever.vectorstore.client.close())
-                else:
-                    retriever.vectorstore.client.close()
-            except Exception:
-                # Ignore cleanup errors
-                pass
-
-
-@contextmanager
-def make_retriever(
-    config: RunnableConfig,
-) -> Generator[VectorStoreRetriever, None, None]:
-    """Create a retriever for the agent, based on the current configuration."""
-    configuration = IndexConfiguration.from_runnable_config(config)
-    embedding_model = make_text_encoder(configuration.embedding_model)
-    user_id = configuration.user_id
-    if not user_id:
-        raise ValueError("Please provide a valid user_id in the configuration.")
-    
-    match configuration.retriever_provider:
-        case "elastic-local":
-            with make_elastic_retriever(configuration, embedding_model) as retriever:
-                yield retriever
-        case _:
-            raise ValueError(
-                "Unrecognized retriever_provider in configuration. "
-                f"Expected one of: {', '.join(Configuration.__annotations__['retriever_provider'].__args__)}\n"
-                f"Got: {configuration.retriever_provider}"
-            )
+        try:
+            await client.close()
+        except Exception:  # Never let cleanup hide the original error.
+            logger.warning("Failed to close the Elasticsearch client", exc_info=True)
