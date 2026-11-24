@@ -403,16 +403,15 @@ def _make_specialist(
     return specialist
 
 
-science_agent = _make_specialist(*SPECIALISTS["science_agent"][1:])
-history_agent = _make_specialist(*SPECIALISTS["history_agent"][1:])
-literature_agent = _make_specialist(*SPECIALISTS["literature_agent"][1:])
-general_agent = _make_specialist(*SPECIALISTS["general_agent"][1:])
 _SPECIALIST_NODES = {
-    "science_agent": science_agent,
-    "history_agent": history_agent,
-    "literature_agent": literature_agent,
-    "general_agent": general_agent,
+    name: _make_specialist(prompt, description)
+    for name, (_, prompt, description) in SPECIALISTS.items()
 }
+# Module-level names for the built-in specialists (kept for importers).
+science_agent = _SPECIALIST_NODES["science_agent"]
+history_agent = _SPECIALIST_NODES["history_agent"]
+literature_agent = _SPECIALIST_NODES["literature_agent"]
+general_agent = _SPECIALIST_NODES["general_agent"]
 
 
 async def critique_agent(state: State, config: RunnableConfig) -> NodeUpdate:
