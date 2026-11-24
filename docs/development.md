@@ -55,8 +55,13 @@ The unit tests run the **real compiled graphs** with test doubles from
 ```python
 async def test_example(fake_llm, knowledge_base):
     knowledge_base.search_results = [Document(page_content="Cats swim in bowls.")]
-    fake_llm.specialist_replies = [tool_call("retrieve_documents", "cats"), AIMessage("In bowls.")]
-    result = await graph.ainvoke({"messages": [HumanMessage("Where do cats swim?")]}, config())
+    fake_llm.specialist_replies = [
+        tool_call("retrieve_documents", "cats"),
+        AIMessage("In bowls."),
+    ]
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage("Where do cats swim?")]}, config()
+    )
     assert result["messages"][-1].content == "In bowls."
 ```
 
