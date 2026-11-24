@@ -37,7 +37,14 @@ def _require_live_services(monkeypatch: pytest.MonkeyPatch) -> None:
     for key, value in dotenv_values().items():
         if value is not None and key not in os.environ:
             monkeypatch.setenv(key, value)
-    missing = [name for name in REQUIRED_ENV_VARS if name not in os.environ]
+    # User/password may be empty (security disabled); everything else must be set.
+    missing = [
+        name
+        for name in REQUIRED_ENV_VARS
+        if name not in os.environ
+        or (not os.environ[name] and not name.startswith("ELASTICSEARCH_"))
+        or (name == "ELASTICSEARCH_URL" and not os.environ[name])
+    ]
     if missing:
         pytest.skip(f"set {', '.join(missing)} in .env to run integration tests")
     url = os.environ["ELASTICSEARCH_URL"]
