@@ -4,7 +4,7 @@ import streamlit as st
 
 from touchstone_ui.client import BackendError
 from touchstone_ui.documents import decode_uploads, parse_urls, split_text
-from touchstone_ui.views.common import START_BACKEND_HINT, Session
+from touchstone_ui.views.common import ERROR_HINT, START_BACKEND_HINT, Session
 
 
 def _index(session: Session, docs: list[str]) -> None:
@@ -17,6 +17,7 @@ def _index(session: Session, docs: list[str]) -> None:
             session.client.index(docs, {"user_id": session.user_id})
         except BackendError as e:
             st.error(f"Couldn't add the {noun}: {e}", icon="⚠️")
+            st.caption(ERROR_HINT)
             return
     st.success(
         f"Added {len(docs)} {noun} to **{session.user_id}**'s knowledge base. "

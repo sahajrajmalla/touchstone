@@ -6,7 +6,12 @@ import streamlit as st
 
 from touchstone_ui.client import BackendError
 from touchstone_ui.events import RunTracker, Source, Step, subject_label
-from touchstone_ui.views.common import START_BACKEND_HINT, Session, reset_conversation
+from touchstone_ui.views.common import (
+    ERROR_HINT,
+    START_BACKEND_HINT,
+    Session,
+    reset_conversation,
+)
 
 EXAMPLES: list[tuple[str, str]] = [
     ("🧪", "Explain the process of photosynthesis and its importance in ecosystems"),
@@ -41,9 +46,14 @@ def _render_sources(sources: list[Source]) -> None:
                 st.caption(_md(source.snippet))
 
 
+def _show_error(message: str) -> None:
+    st.error(message, icon="⚠️")
+    st.caption(ERROR_HINT)
+
+
 def _render_assistant(message: dict[str, Any]) -> None:
     if message.get("error"):
-        st.error(message["content"], icon="⚠️")
+        _show_error(message["content"])
         return
     with st.status(message["summary"], state="complete", expanded=False):
         for step in message["steps"]:
@@ -92,7 +102,7 @@ def _answer(session: Session, question: str) -> None:
         if tracker.error or tracker.answer is None:
             error = tracker.error or "The run finished without an answer."
             status.update(label="Couldn't answer this time", state="error")
-            st.error(error, icon="⚠️")
+            _show_error(error)
             st.session_state["messages"].append(
                 {"role": "assistant", "content": error, "error": True}
             )

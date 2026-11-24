@@ -12,6 +12,10 @@ START_BACKEND_HINT = (
     "Start it in another terminal with `make dev`, or run the backend and UI "
     "together with `make start`."
 )
+ERROR_HINT = (
+    "Tip: run `make doctor` to check your API keys and services. A missing or "
+    "empty ANTHROPIC_API_KEY shows up as a connection error."
+)
 
 
 @st.cache_resource(show_spinner=False)
