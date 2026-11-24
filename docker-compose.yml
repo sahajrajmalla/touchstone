@@ -1,0 +1,33 @@
+# Local Elasticsearch for Touchstone - development only.
+#   make es-up      start (waits until healthy; data persists in a volume)
+#   make es-down    stop
+#   make es-reset   delete the container and all indexed data
+# Values come from .env (ELASTICSEARCH_PASSWORD, optional ELASTICSEARCH_BIND).
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.1
+    container_name: touchstone-elasticsearch
+    environment:
+      discovery.type: single-node
+      ELASTIC_PASSWORD: ${ELASTICSEARCH_PASSWORD:?Set ELASTICSEARCH_PASSWORD in .env}
+      xpack.security.enabled: "true"
+      xpack.security.http.ssl.enabled: "false"
+      xpack.license.self_generated.type: trial
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    ports:
+      - "${ELASTICSEARCH_BIND:-127.0.0.1}:9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fs -u "elastic:$$ELASTIC_PASSWORD" http://localhost:9200/_cluster/health >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  es-data:

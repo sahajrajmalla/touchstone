@@ -103,7 +103,7 @@ convention = "google"
 python_version = "3.11"
 strict = true
 mypy_path = "src"
-packages = ["retrieval_graph", "touchstone_ui"]
+files = ["src", "scripts"]
 warn_unreachable = true
 
 ######################
