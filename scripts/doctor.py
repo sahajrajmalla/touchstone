@@ -200,6 +200,12 @@ def start_local_elasticsearch() -> bool:
     host = urlparse(os.environ.get("ELASTICSEARCH_URL", "")).hostname
     if host not in ("localhost", "127.0.0.1") or not shutil.which("docker"):
         return False
+    if not os.environ.get("ELASTICSEARCH_PASSWORD"):
+        # docker-compose.yml reads it from .env; an empty one can't start the cluster.
+        print(
+            _paint("Set ELASTICSEARCH_PASSWORD in .env to start Elasticsearch.", "33")
+        )
+        return False
     print(_paint("Starting Elasticsearch with Docker (make es-up)…", "36"), flush=True)
     result = subprocess.run(
         ["docker", "compose", "up", "-d", "--wait", "elasticsearch"],

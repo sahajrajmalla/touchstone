@@ -64,6 +64,9 @@ ui: _require-uv ## Start only the web UI (expects the backend from `make dev`)
 ##@ Elasticsearch (Docker)
 
 es-up: _require-docker .env ## Start Elasticsearch and wait until it is healthy
+	@[ -n "$$ELASTICSEARCH_PASSWORD" ] || grep -Eq '^ELASTICSEARCH_PASSWORD=.+' .env || { \
+		echo "Set ELASTICSEARCH_PASSWORD in .env first (any password - it becomes the 'elastic' user's)."; \
+		exit 1; }
 	$(COMPOSE) up -d --wait elasticsearch
 	@echo "Elasticsearch is ready at http://localhost:9200"
 

@@ -10,7 +10,9 @@ services:
     container_name: touchstone-elasticsearch
     environment:
       discovery.type: single-node
-      ELASTIC_PASSWORD: ${ELASTICSEARCH_PASSWORD:?Set ELASTICSEARCH_PASSWORD in .env}
+      # Read from .env at runtime - never put a literal password here.
+      # `make es-up` checks that it is set.
+      ELASTIC_PASSWORD: ${ELASTICSEARCH_PASSWORD}
       xpack.security.enabled: "true"
       xpack.security.http.ssl.enabled: "false"
       xpack.license.self_generated.type: trial
