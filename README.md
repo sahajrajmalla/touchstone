@@ -68,6 +68,8 @@ questions and `indexer` adds documents - plain text, web pages or PDFs (by URL).
 the **Knowledge base** page, then ask on the **Ask** page. A live trace shows how the agents
 worked, and each answer lists its sources. See the [UI guide](docs/ui.md).
 
+![The Touchstone web UI showing the agents' trace for a question (demo content)](docs/images/ui-ask.jpg)
+
 **LangGraph Studio** (`make dev`). Visualise the graph, inspect state at every step and
 re-run from any node. Select the `indexer` or `retrieval_graph` graph and set `user_id` in
 the configuration panel.

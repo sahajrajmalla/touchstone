@@ -4,6 +4,8 @@ The Touchstone web UI is a [Streamlit](https://streamlit.io/) app for students a
 teachers. It covers asking questions, watching the agents work and managing a knowledge
 base.
 
+![Ask page: the agents' trace for a question (demo content)](images/ui-ask.jpg)
+
 ## Start it
 
 ```bash
