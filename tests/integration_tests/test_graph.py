@@ -6,6 +6,8 @@ from langsmith import expect, unit
 
 from retrieval_graph import graph, index_graph
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.asyncio
 @unit

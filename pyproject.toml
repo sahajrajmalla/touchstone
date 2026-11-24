@@ -121,6 +121,10 @@ filterwarnings = [
     # Kept on purpose: switching to `context_schema` changes how callers pass
     # configuration (see docs/development.md). Revisit before LangGraph 2.0.
     "ignore:`config_schema` is deprecated:DeprecationWarning",
+    # Web search still uses langchain-community's TavilySearchResults; migrating
+    # to `langchain-tavily` is tracked in docs/development.md.
+    "ignore:`langchain-community` is being sunset:DeprecationWarning",
+    "ignore:The class `TavilySearchResults` was deprecated",
 ]
 
 [tool.coverage.run]
