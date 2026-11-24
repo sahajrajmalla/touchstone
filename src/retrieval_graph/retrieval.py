@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 SUPPORTED_RETRIEVER_PROVIDERS = ("elastic-local",)
 ELASTICSEARCH_INDEX_NAME = "langchain_index"
 """Elasticsearch index that stores every user's documents (filtered by user_id)."""
+USER_ID_FIELD = "metadata.user_id.keyword"
+"""Exact-match field for the per-user filter.
+
+Metadata is mapped dynamically, so ``metadata.user_id`` is an *analyzed* text field
+(lowercased and split on punctuation). Filtering on it made "Alice" or "student-42"
+match nothing, and let "alice" also match the documents of "alice-smith". The
+``.keyword`` sub-field holds the exact value (up to 256 characters).
+"""
 
 
 def make_text_encoder(model: str) -> Embeddings:
@@ -104,7 +112,7 @@ def _make_elastic_retriever(
     # so the caller's configuration is never mutated.
     search_kwargs["filter"] = [
         *search_kwargs.get("filter", []),
-        {"term": {"metadata.user_id": configuration.user_id}},
+        {"term": {USER_ID_FIELD: configuration.user_id}},
     ]
     search_kwargs.setdefault("k", 1)
     return store.as_retriever(search_kwargs=search_kwargs), client

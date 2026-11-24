@@ -79,7 +79,7 @@ async def test_make_retriever_scopes_search_to_user_and_closes_client(
             "k": 2,
             "filter": [
                 {"term": {"metadata.year": 2024}},
-                {"term": {"metadata.user_id": "alice"}},
+                {"term": {"metadata.user_id.keyword": "alice"}},
             ],
         }
         assert closed_clients == []
