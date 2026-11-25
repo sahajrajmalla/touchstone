@@ -56,7 +56,9 @@ def test_ask_streams_updates_for_the_retrieval_graph(sdk: FakeSDK) -> None:
     assert kwargs["input"] == {
         "messages": [{"role": "user", "content": "What is DNA?"}]
     }
-    assert kwargs["config"] == {"configurable": {"user_id": "alice"}}
+    # Settings travel as the run context; the server rejects context + configurable.
+    assert kwargs["context"] == {"user_id": "alice"}
+    assert "config" not in kwargs
     assert kwargs["stream_mode"] == "updates"
     assert client.api_url == "http://server:2024"
 
@@ -71,6 +73,8 @@ def test_index_runs_the_indexer_statelessly(sdk: FakeSDK) -> None:
     name, args, kwargs = sdk.calls[0]
     assert (name, args) == ("runs.wait", (None, "indexer"))
     assert kwargs["input"] == {"docs": ["a", "b"]}
+    assert kwargs["context"] == {"user_id": "alice"}
+    assert "config" not in kwargs
     assert kwargs["raise_error"] is False
 
 

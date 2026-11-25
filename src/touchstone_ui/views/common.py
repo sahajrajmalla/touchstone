@@ -33,7 +33,7 @@ class Session:
     user_id: str
     connected: bool
     overrides: dict[str, Any] = field(default_factory=dict)
-    """Configuration overrides for the retrieval graph (models, web search)."""
+    """Settings overrides for the retrieval graph (models, web search)."""
 
     @property
     def ready(self) -> bool:
@@ -41,8 +41,8 @@ class Session:
         return self.connected and bool(self.user_id)
 
     @property
-    def configurable(self) -> dict[str, Any]:
-        """The ``configurable`` section sent with every retrieval run."""
+    def context(self) -> dict[str, Any]:
+        """The run context (settings) sent with every retrieval run."""
         return {"user_id": self.user_id, **self.overrides}
 
 

@@ -140,14 +140,14 @@ class FakeClient:
         return f"thread-{self.threads}"
 
     def ask(
-        self, thread_id: str, question: str, configurable: Mapping[str, Any]
+        self, thread_id: str, question: str, context: Mapping[str, Any]
     ) -> Iterator[tuple[str, Any]]:
-        self.asked.append((thread_id, question, dict(configurable)))
+        self.asked.append((thread_id, question, dict(context)))
         if self.ask_error:
             raise BackendError(self.ask_error)
         yield from self.stream
 
-    def index(self, docs: Sequence[str], configurable: Mapping[str, Any]) -> None:
+    def index(self, docs: Sequence[str], context: Mapping[str, Any]) -> None:
         if self.index_error:
             raise BackendError(self.index_error)
-        self.indexed.append((list(docs), dict(configurable)))
+        self.indexed.append((list(docs), dict(context)))
