@@ -41,13 +41,21 @@ All notable changes to this project are documented here. The format follows
   setup; `make start` runs the backend and UI together.
 - `.env.example`, `docker-compose.yml` for a local Elasticsearch (`make es-up`), GitHub
   Actions CI (Python 3.11-3.13), pre-commit hooks and `.editorconfig`.
-- 115 offline unit tests (scripted models, in-memory store, headless UI runs) and an
+- 133 offline unit tests (scripted models, in-memory store, headless UI runs) and an
   integration test for user isolation.
 - Documentation in `docs/`: architecture, configuration, UI, Elasticsearch, development and
   troubleshooting.
 
 ### Changed
 
+- **Run settings are now the run context.** They use LangGraph's `context_schema` in
+  place of the deprecated `config_schema`, which LangGraph 2.0 removes.
+  - Nodes read `runtime.context`, and the web UI sends `context=`.
+  - Studio shows the same settings as before.
+  - The graph topology and input/output schemas are unchanged.
+  - The unit tests now fail on any LangGraph deprecation warning.
+- `retrieval.make_retriever(...)` and `index_graph.ensure_docs_have_user_id(...)` now take
+  an `IndexConfiguration` (or a `Configuration`) instead of a `RunnableConfig`.
 - The four specialist agents share one implementation, driven by a `SPECIALISTS` registry.
   The graph topology and schemas are unchanged.
 - Python distribution renamed to `touchstone` (import path `retrieval_graph` unchanged).
@@ -56,6 +64,30 @@ All notable changes to this project are documented here. The format follows
 - Strict mypy passes for the whole codebase.
 - `make` targets renamed: `test-integration`, `test-watch` and others. The old names still
   work as aliases.
+
+### Deprecated
+
+- **Passing settings in `config["configurable"]`.** Python calls without a context still
+  read settings from `configurable`, but they emit a `DeprecationWarning`. This fallback
+  will be removed in a future release.
+
+### Migrating callers
+
+Details are in [Configuration](docs/configuration.md#migrating-from-configurable).
+
+- **Python.** Replace `graph.ainvoke(inputs, {"configurable": {"user_id": "alice"}})` with
+  `graph.ainvoke(inputs, context={"user_id": "alice"})`. Keep `thread_id` in
+  `configurable`. If you pass both, the context wins.
+- **LangGraph SDK.** Replace `config={"configurable": {...}}` with `context={...}`. The
+  server still accepts `configurable` on its own, but it rejects a run that sends both
+  (HTTP 400). Saved Studio assistants keep working.
+- **Direct helper calls.** Use `make_retriever(IndexConfiguration(user_id="alice"))` and
+  `ensure_docs_have_user_id(docs, IndexConfiguration(user_id="alice"))`.
+- **Dict contexts.** A dict may only hold the fields of the graph you call: the indexer
+  rejects retrieval-only fields with a `TypeError`. A `Configuration` instance works for
+  both graphs.
+- **Missing `user_id`.** A context without a valid `user_id` (and no `USER_ID` in the
+  environment) now fails when the run starts, before the first node.
 
 ## [0.0.1]
 

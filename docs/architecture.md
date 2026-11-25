@@ -142,12 +142,75 @@ All users share one Elasticsearch index. Every search is filtered with an exact 
 > [LangGraph custom auth](https://langchain-ai.github.io/langgraph/concepts/auth/), before
 > storing anything private.
 
+## Run settings (`context_schema`)
+
+The settings in `configuration.py` are each graph's **context schema**: `Configuration` for
+`retrieval_graph` and `IndexConfiguration`, its first group of fields, for `indexer`. Nodes
+read them from the `runtime` that LangGraph injects, through one helper:
+
+```python
+async def classify_query(state, config, runtime: Runtime[Configuration] | None = None):
+    configuration = Configuration.from_runtime(runtime, config)
+```
+
+Inside a graph run LangGraph always injects `runtime`. The `None` default only keeps direct
+calls such as `await science_agent(state, config)` working, and it lets the signature match
+LangGraph's typed `(state, config)` node protocol. Helpers such as
+`retrieval.make_retriever` and the indexer's `ensure_docs_have_user_id` take the settings
+object, so only the nodes know where settings come from.
+
+How each caller's settings reach the nodes:
+
+| Caller | Sends | The nodes read |
+| --- | --- | --- |
+| Touchstone UI | `context={...}` with `langgraph_sdk` | `runtime.context` |
+| LangGraph Studio | The assistant's settings | `runtime.context`: the server keeps an assistant's `context` and `configurable` in sync |
+| LangGraph SDK, older style | `config={"configurable": {...}}` | `runtime.context`: the server copies `configurable` into the context |
+| LangGraph SDK, both at once | `context` and `configurable` | Nothing: the server rejects the run with HTTP 400 |
+| Python, `graph.ainvoke(inputs, context={...})` | A dict or a `Configuration` | `runtime.context`: LangGraph builds the dataclass, so an unknown key raises `TypeError` |
+| Python, older style `graph.ainvoke(inputs, {"configurable": {...}})` | No context | `config["configurable"]`, with a `DeprecationWarning` |
+
+Rules that follow:
+
+- **The context wins.** When a run has a context, settings in `configurable` are ignored.
+  LangGraph gives nodes a complete `Configuration` with defaults filled in, so the two
+  cannot be merged field by field.
+- `thread_id` and the other checkpoint keys stay in `configurable`. They are not settings
+  and never trigger the warning.
+- A missing `user_id` now fails as the run starts, because LangGraph builds the context
+  before the first node runs. Before, it failed in the first node.
+
+Trade-offs:
+
+- **Chosen: a `context_schema`, read from `runtime.context`, with a deprecated fallback to
+  `configurable`.** This works on the installed LangGraph 1.x and removes the last use of an
+  API that LangGraph 2.0 deletes. The settings shown in Studio are unchanged, because
+  `config_schema=` was already an alias that set `context_schema`. Existing callers keep
+  working:
+  - through the server, they need no change;
+  - in direct Python calls, they get a warning.
+  The cost is two code paths until the fallback is removed. The tests cover both.
+- *Rejected: read only `runtime.context`.* It is simpler, but a direct
+  `graph.ainvoke(..., {"configurable": ...})` call would silently lose its settings and run
+  with the defaults. That includes `USER_ID`, which could select another user's knowledge
+  base.
+- *Rejected: keep reading `configurable` and drop the schema.* Studio builds its settings
+  panel from the context schema. Without one, Studio would show no settings, and the server
+  would stop dropping unknown keys.
+- *Rejected: a `TypedDict` context with every field optional.* It would allow merging a
+  context over `configurable`, but Studio would lose the defaults it shows, and the
+  validation in `__post_init__` would be lost too.
+
+`pyproject.toml` turns every `LangGraphDeprecationWarning` into a test failure, so code that
+LangGraph 2.0 removes cannot come back unnoticed. `langgraph` stays pinned below 2 until 2.0
+is released and tested.
+
 ## Design decisions
 
 | Decision | Why |
 | --- | --- |
 | The UI is an API client, not an in-process caller | One backend serves Studio, the UI and deployments; threads persist on the server; the UI process stays light. |
-| `config_schema` is kept although LangGraph 1.x deprecates it | Moving to `context_schema` changes how every caller passes settings (`configurable` -> `context`). Do it as a deliberate migration before LangGraph 2.0. |
+| Run settings are the graphs' `context_schema`, read from `runtime.context`, with `configurable` as a deprecated fallback | LangGraph 2.0 removes `config_schema`. The server already copies `configurable` into the context, so its callers keep working, and direct Python callers get a `DeprecationWarning`. See [Run settings](#run-settings-context_schema). |
 | Async Elasticsearch client per search, closed in an `async with` | No event-loop juggling or threads, and no leaked connections. |
 | Loop counters derived from messages | No new state fields, and they work with any checkpointer. |
 | Specialists share one implementation (`SPECIALISTS` registry) | Adding a subject is a prompt plus a registry entry. See [Development](development.md#add-a-specialist-agent). |

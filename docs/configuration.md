@@ -3,9 +3,9 @@
 Touchstone has two kinds of settings:
 
 - **Environment variables** (`.env`): keys and connections, read by the server process.
-- **Run configuration**: per-run choices such as models and the user ID, passed with each
-  run. They come from the UI sidebar, LangGraph Studio's configuration panel or
-  `{"configurable": {...}}` in code.
+- **Run configuration**: per-run choices such as models and the user ID, passed as each
+  run's *context*. They come from the UI sidebar, LangGraph Studio's configuration panel,
+  `context={...}` with the LangGraph SDK, or `graph.ainvoke(..., context={...})` in Python.
 
 Check your setup at any time with `make doctor`.
 
@@ -30,8 +30,9 @@ UI and `make doctor`.
 
 ## Run configuration
 
-Defined in `src/retrieval_graph/configuration.py`. The indexer accepts the first group of
-fields; the retrieval graph accepts all of them.
+Defined in `src/retrieval_graph/configuration.py`. These dataclasses are the graphs' context
+schemas, so Studio shows them as each graph's settings. The indexer accepts the first group
+of fields; the retrieval graph accepts all of them.
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -46,19 +47,63 @@ fields; the retrieval graph accepts all of them.
 | `web_search_api_key` | `$TAVILY_API_KEY` | Tavily key, if different from the environment. |
 | `response_system_prompt`, `query_system_prompt`, `min_retrieval_threshold` | - | Reserved; not currently used. |
 
-Example:
+Pass the settings as the run's `context`:
 
 ```python
-config = {
-    "configurable": {
-        "user_id": "alice",
-        "response_model": "anthropic/claude-opus-5-5",
-        "search_kwargs": {"k": 3},
-        "enable_web_search": False,
-    }
+context = {
+    "user_id": "alice",
+    "response_model": "anthropic/claude-opus-5-5",
+    "search_kwargs": {"k": 3},
+    "enable_web_search": False,
 }
-await graph.ainvoke({"messages": [("user", "Explain entropy")]}, config)
+await graph.ainvoke({"messages": [("user", "Explain entropy")]}, context=context)
 ```
+
+- A `Configuration(...)` instance works too, and both graphs accept it.
+- A dict may only hold fields of the graph you call. For example, the indexer rejects
+  `response_model` with a `TypeError`. The LangGraph server drops unknown keys instead.
+- For a persistent thread, `thread_id` still goes in the config:
+  `graph.ainvoke(inputs, {"configurable": {"thread_id": "t1"}}, context=context)`.
+
+With the [LangGraph SDK](https://langchain-ai.github.io/langgraph/cloud/reference/sdk/python_sdk_ref/)
+against `make dev` or a deployment:
+
+```python
+from langgraph_sdk import get_client
+
+client = get_client(url="http://127.0.0.1:2024")
+result = await client.runs.wait(
+    None,
+    "retrieval_graph",
+    input={"messages": [{"role": "user", "content": "Explain entropy"}]},
+    context={"user_id": "alice"},
+)
+```
+
+### Migrating from `configurable`
+
+Before this change, settings were passed in `config["configurable"]`. LangGraph 2.0 removes
+the `config_schema` that this relied on, so settings are now the run context.
+
+| Before | After |
+| --- | --- |
+| `graph.ainvoke(inputs, {"configurable": {"user_id": "alice"}})` | `graph.ainvoke(inputs, context={"user_id": "alice"})` |
+| `{"configurable": {"user_id": "alice", "thread_id": "t1"}}` | `{"configurable": {"thread_id": "t1"}}` plus `context={"user_id": "alice"}` |
+| `client.runs.stream(..., config={"configurable": {...}})` | `client.runs.stream(..., context={...})` (also `runs.wait` and `runs.create`) |
+| `retrieval.make_retriever(config)` | `retrieval.make_retriever(IndexConfiguration(user_id="alice"))` |
+| `index_graph.ensure_docs_have_user_id(docs, config)` | `index_graph.ensure_docs_have_user_id(docs, IndexConfiguration(user_id="alice"))` |
+
+- **Python calls in the old style still work**, but they emit a `DeprecationWarning`. The
+  fallback will be removed in a future release.
+- **If a Python call passes both**, the context wins and the settings in `configurable` are
+  ignored.
+- **LangGraph server callers** (the SDK, Studio, saved assistants) can keep using
+  `configurable`, because the server copies it into the context. Never send both: the server
+  rejects that with HTTP 400.
+- **`make_retriever` and `ensure_docs_have_user_id` take the settings object** and no longer
+  accept a config. Direct callers have to update.
+- **A context without a valid `user_id`** fails when the run starts, before the first node,
+  unless `USER_ID` is set.
 
 ## Choosing models
 
@@ -91,7 +136,9 @@ Changing the embedding model changes the vectors, so re-index afterwards (below)
 
 - **User IDs are matched exactly.** Before, mixed-case or hyphenated IDs found nothing, and
   IDs sharing a word could see each other's documents.
-- **`retrieval.make_retriever`** is now an async context manager:
-  `async with make_retriever(config) as retriever:`.
+- **`retrieval.make_retriever`** is now an async context manager that takes the settings:
+  `async with make_retriever(IndexConfiguration(user_id="alice")) as retriever:`.
+- **Settings are the run context.** Pass `context={...}` instead of
+  `{"configurable": {...}}` (see [Migrating from `configurable`](#migrating-from-configurable)).
 - The Python distribution is now called `touchstone`. The import path is still
   `retrieval_graph`.

@@ -83,12 +83,13 @@ from retrieval_graph import graph, index_graph
 
 
 async def main() -> None:
-    config = {"configurable": {"user_id": "alice"}}
+    context = {"user_id": "alice"}  # run settings: user, models, search
     await index_graph.ainvoke(
-        {"docs": ["Photosynthesis converts light energy into chemical energy."]}, config
+        {"docs": ["Photosynthesis converts light energy into chemical energy."]},
+        context=context,
     )
     result = await graph.ainvoke(
-        {"messages": [("user", "What is photosynthesis?")]}, config
+        {"messages": [("user", "What is photosynthesis?")]}, context=context
     )
     print(result["messages"][-1].content)
 
@@ -110,7 +111,7 @@ Keys and connection settings live in `.env` ([template](.env.example)):
 | `LANGSMITH_API_KEY` | no | Tracing in LangSmith |
 
 Per-run settings - models, web search, number of documents retrieved - are set in the UI
-sidebar, in Studio's configuration panel or in `{"configurable": {...}}`. The defaults are
+sidebar, in Studio's configuration panel or with `context={...}` in code. The defaults are
 `anthropic/claude-sonnet-5-5` for answers and critique, `anthropic/claude-haiku-5-5` for
 routing and `google/gemini-embedding-001` for embeddings. Full reference:
 [Configuration](docs/configuration.md).
