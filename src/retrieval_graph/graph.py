@@ -27,6 +27,7 @@ from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, ToolMess
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import tool
+from langchain_tavily import TavilySearch
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel
 
@@ -251,27 +252,36 @@ async def _run_web_search(
     if not configuration.enable_web_search:
         return "Web search is disabled in the configuration.", []
 
+    # Without a configured key, TavilySearch falls back to TAVILY_API_KEY.
+    api_key: dict[str, Any] = (
+        {"tavily_api_key": configuration.web_search_api_key}
+        if configuration.web_search_api_key
+        else {}
+    )
     try:
-        from langchain_community.tools import TavilySearchResults
-        from langchain_community.utilities.tavily_search import TavilySearchAPIWrapper
-
-        if configuration.web_search_api_key:
-            search_tool = TavilySearchResults(
-                max_results=WEB_SEARCH_MAX_RESULTS,
-                api_wrapper=TavilySearchAPIWrapper(
-                    tavily_api_key=configuration.web_search_api_key  # type: ignore[arg-type]
-                ),
-            )
-        else:  # The wrapper falls back to the TAVILY_API_KEY environment variable.
-            search_tool = TavilySearchResults(max_results=WEB_SEARCH_MAX_RESULTS)
+        # Same request as the former langchain-community TavilySearchResults.
+        search_tool = TavilySearch(
+            max_results=WEB_SEARCH_MAX_RESULTS,
+            search_depth="advanced",
+            include_answer=False,
+            include_raw_content=False,
+            include_images=False,
+            **api_key,
+        )
         # Async call: a sync HTTP request would block the event loop (and is
         # rejected by `langgraph dev`).
-        search_results = await search_tool.ainvoke({"query": query})
-        if isinstance(search_results, str):  # The tool reports failures as text.
-            return f"Error during web search: {search_results}", []
+        response = await search_tool.ainvoke({"query": query})
+        if isinstance(response, str):
+            # TavilySearch raises a ToolException when nothing matched, and the
+            # tool (handle_tool_error=True) returns its message instead.
+            if response.startswith("No search results found"):
+                return "No results found from web search.", []
+            return f"Error during web search: {response}", []
+        if "error" in response:  # API and network failures: {"error": exception}
+            return f"Error during web search: {response['error']!s}", []
 
         web_docs = []
-        for result in search_results:
+        for result in response.get("results", []):
             if isinstance(result, dict):
                 content = result.get("content", "")
                 if len(content) > MAX_WEB_RESULT_CHARS:

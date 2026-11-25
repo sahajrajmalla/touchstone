@@ -134,9 +134,6 @@ documents, caching and response-time monitoring.
 - **`config_schema` is deprecated** in LangGraph 1.x (removed in 2.0). Moving to
   `context_schema` + `Runtime` changes how callers pass settings (`context=` instead of
   `configurable`), so it is a deliberate migration. `langgraph` is pinned below 2.
-- **Web search uses `TavilySearchResults`** from `langchain-community`, which is being
-  sunset. Migrating to `langchain_tavily.TavilySearch` (different response format) would
-  also remove the `langchain-community` dependency. Validate it against the live Tavily API.
 - **`score_threshold` in `search_kwargs` is not applied** by the default similarity search.
 - **HTML extraction** joins adjacent block elements without a space in minified pages
   ("Heading" + "Text" -> "HeadingText").

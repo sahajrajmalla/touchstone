@@ -1,11 +1,14 @@
 """End-to-end runs of the retrieval graph with scripted models (no network)."""
 
 import importlib
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import ToolException
+from langchain_tavily.tavily_search import TavilySearchAPIWrapper
 from langgraph.checkpoint.memory import InMemorySaver
 
 from retrieval_graph import graph
@@ -268,27 +271,39 @@ async def test_critique_retries_are_capped(
 ######################
 
 
-class FakeTavily:
-    """Stands in for langchain_community's TavilySearchResults."""
+@dataclass
+class FakeTavilyAPI:
+    """Replaces the Tavily HTTP request; the real TavilySearch tool runs on top.
 
-    response: Any = []
-    init_kwargs: dict[str, Any] = {}
+    Set ``response`` (the API's JSON) or ``error`` (raised by the request), then
+    inspect ``requests`` (the search parameters) and ``api_keys``.
+    """
 
-    def __init__(self, **kwargs: Any) -> None:
-        FakeTavily.init_kwargs = kwargs
-
-    async def ainvoke(self, payload: dict[str, str]) -> Any:
-        return FakeTavily.response
+    response: dict[str, Any] = field(default_factory=lambda: {"results": []})
+    error: Exception | None = None
+    requests: list[dict[str, Any]] = field(default_factory=list)
+    api_keys: list[str] = field(default_factory=list)
 
 
 @pytest.fixture
-def tavily(monkeypatch: pytest.MonkeyPatch) -> type[FakeTavily]:
-    import langchain_community.tools
+def tavily(monkeypatch: pytest.MonkeyPatch) -> FakeTavilyAPI:
+    api = FakeTavilyAPI()
 
-    FakeTavily.response = []
-    FakeTavily.init_kwargs = {}
-    monkeypatch.setattr(langchain_community.tools, "TavilySearchResults", FakeTavily)
-    return FakeTavily
+    async def raw_results_async(
+        self: TavilySearchAPIWrapper, **params: Any
+    ) -> dict[str, Any]:
+        api.requests.append(params)
+        api.api_keys.append(self.tavily_api_key.get_secret_value())
+        if api.error:
+            raise api.error
+        return api.response
+
+    def raw_results(self: TavilySearchAPIWrapper, **params: Any) -> dict[str, Any]:
+        raise AssertionError("blocking HTTP call: use the async API")
+
+    monkeypatch.setattr(TavilySearchAPIWrapper, "raw_results_async", raw_results_async)
+    monkeypatch.setattr(TavilySearchAPIWrapper, "raw_results", raw_results)
+    return api
 
 
 async def run_tools(*calls: AIMessage, **configurable: Any) -> dict[str, Any]:
@@ -296,11 +311,18 @@ async def run_tools(*calls: AIMessage, **configurable: Any) -> dict[str, Any]:
     return await graph_module.handle_tool_calls(state, config(**configurable))
 
 
-async def test_web_search_results_become_documents(tavily: type[FakeTavily]) -> None:
-    tavily.response = [
-        {"title": "Photosynthesis", "url": "https://e.org/p", "content": "c" * 5000},
-        "not-a-dict",
-    ]
+async def test_web_search_results_become_documents(tavily: FakeTavilyAPI) -> None:
+    tavily.response = {
+        "query": "photosynthesis",
+        "results": [
+            {
+                "title": "Photosynthesis",
+                "url": "https://e.org/p",
+                "content": "c" * 5000,
+            },
+            "not-a-dict",
+        ],
+    }
     out = await run_tools(
         tool_call("web_search", "photosynthesis"), web_search_api_key="tvly-1"
     )
@@ -311,31 +333,77 @@ async def test_web_search_results_become_documents(tavily: type[FakeTavily]) -> 
         "title": "Photosynthesis",
         "type": "web_search",
     }
-    assert doc.page_content.endswith("[WEB CONTENT TRUNCATED]")
+    assert doc.page_content == "c" * 2000 + "... [WEB CONTENT TRUNCATED]"
     assert out["messages"][0].content.startswith("Found 1 relevant web result(s)")
-    assert (
-        tavily.init_kwargs["api_wrapper"].tavily_api_key.get_secret_value() == "tvly-1"
-    )
+    assert tavily.api_keys == ["tvly-1"]
 
 
-async def test_web_search_errors_are_reported(tavily: type[FakeTavily]) -> None:
-    tavily.response = "Exception('Error 401: Unauthorized')"
-    out = await run_tools(tool_call("web_search"))
+async def test_web_search_sends_the_same_request_as_before(
+    tavily: FakeTavilyAPI,
+) -> None:
+    # The parameters langchain-community's TavilySearchResults used to send.
+    tavily.response = {"results": [{"url": "u", "title": "t", "content": "c"}]}
+    await run_tools(tool_call("web_search", "photosynthesis"), web_search_api_key="k")
+    (request,) = tavily.requests
+    assert request["query"] == "photosynthesis"
+    assert request["max_results"] == graph_module.WEB_SEARCH_MAX_RESULTS == 3
+    assert request["search_depth"] == "advanced"
+    assert request["include_answer"] is False
+    assert request["include_raw_content"] is False
+    assert request["include_images"] is False
+
+
+async def test_web_search_falls_back_to_the_environment_key(
+    tavily: FakeTavilyAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-env")
+    tavily.response = {"results": [{"url": "u", "title": "t", "content": "c"}]}
+    await run_tools(tool_call("web_search"), web_search_api_key="")
+    assert tavily.api_keys == ["tvly-env"]
+
+
+async def test_web_search_errors_are_reported(tavily: FakeTavilyAPI) -> None:
+    # TavilySearch returns API and network failures as {"error": exception}.
+    tavily.error = Exception("Error 401: Unauthorized")
+    out = await run_tools(tool_call("web_search"), web_search_api_key="tvly-bad")
     assert out["messages"][0].content == (
-        "Error during web search: Exception('Error 401: Unauthorized')"
+        "Error during web search: Error 401: Unauthorized"
     )
     assert out["retrieved_docs"] == []
 
 
+async def test_missing_web_search_key_is_reported(tavily: FakeTavilyAPI) -> None:
+    out = await run_tools(tool_call("web_search"))
+    content = out["messages"][0].content
+    assert content.startswith("Error during web search: ")
+    assert "tavily_api_key" in content
+    assert tavily.requests == []
+
+
+async def test_empty_web_search_reports_no_results(tavily: FakeTavilyAPI) -> None:
+    # TavilySearch raises a ToolException for an empty result list.
+    out = await run_tools(tool_call("web_search"), web_search_api_key="k")
+    assert out["messages"][0].content == "No results found from web search."
+    assert out["retrieved_docs"] == []
+
+
+async def test_other_tool_errors_are_not_reported_as_no_results(
+    tavily: FakeTavilyAPI,
+) -> None:
+    tavily.error = ToolException("Rate limit exceeded")
+    out = await run_tools(tool_call("web_search"), web_search_api_key="k")
+    assert out["messages"][0].content == "Error during web search: Rate limit exceeded"
+
+
 async def test_web_search_can_be_disabled(
-    fake_llm: FakeLLM, knowledge_base: FakeKnowledgeBase, tavily: type[FakeTavily]
+    fake_llm: FakeLLM, knowledge_base: FakeKnowledgeBase, tavily: FakeTavilyAPI
 ) -> None:
     await ask("Q", enable_web_search=False)
     assert fake_llm.specialist_calls()[0].tools == ["retrieve_documents"]
 
     out = await run_tools(tool_call("web_search"), enable_web_search=False)
     assert out["messages"][0].content == "Web search is disabled in the configuration."
-    assert tavily.init_kwargs == {}
+    assert tavily.requests == []
 
 
 async def test_both_tools_are_offered_by_default(

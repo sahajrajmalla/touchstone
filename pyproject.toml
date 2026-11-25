@@ -16,8 +16,8 @@ dependencies = [
     "langchain>=1.0,<2",
     "langchain-core>=1.0,<2",
     "langchain-anthropic>=1.0,<2",
-    # Only used for the Tavily web-search tool (TavilySearchResults).
-    "langchain-community>=0.4,<0.5",
+    # The web_search tool (TavilySearch). 0.x: minor releases may break the API.
+    "langchain-tavily>=0.2.18,<0.3",
     # 1.x renamed AsyncElasticsearchStore(es_connection=...) to client=...
     "langchain-elasticsearch>=1.0,<2",
     "langchain-google-genai>=4.0,<5",
@@ -122,10 +122,6 @@ filterwarnings = [
     # Kept on purpose: switching to `context_schema` changes how callers pass
     # configuration (see docs/development.md). Revisit before LangGraph 2.0.
     "ignore:`config_schema` is deprecated:DeprecationWarning",
-    # Web search still uses langchain-community's TavilySearchResults; migrating
-    # to `langchain-tavily` is tracked in docs/development.md.
-    "ignore:`langchain-community` is being sunset:DeprecationWarning",
-    "ignore:The class `TavilySearchResults` was deprecated",
 ]
 
 [tool.coverage.run]
