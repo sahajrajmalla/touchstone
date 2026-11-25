@@ -88,9 +88,7 @@ def _answer(session: Session, question: str) -> None:
         status = st.status("Reading your question…", expanded=True)
         try:
             thread_id = _thread_id(session)
-            for event, data in session.client.ask(
-                thread_id, question, session.configurable
-            ):
+            for event, data in session.client.ask(thread_id, question, session.context):
                 for step in tracker.consume(event, data):
                     _write_step(status, step)
                     if step.kind == "route":

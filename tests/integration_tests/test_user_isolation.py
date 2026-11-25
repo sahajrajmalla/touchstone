@@ -10,13 +10,14 @@ import uuid
 import pytest
 
 from retrieval_graph import index_graph, retrieval
+from retrieval_graph.configuration import IndexConfiguration
 
 pytestmark = pytest.mark.integration
 
 
 async def search(user_id: str, query: str) -> list[str]:
-    config = {"configurable": {"user_id": user_id, "search_kwargs": {"k": 10}}}
-    async with retrieval.make_retriever(config) as retriever:  # type: ignore[arg-type]
+    configuration = IndexConfiguration(user_id=user_id, search_kwargs={"k": 10})
+    async with retrieval.make_retriever(configuration) as retriever:
         docs = await retriever.ainvoke(query)
     return [doc.metadata["user_id"] for doc in docs]
 
@@ -28,11 +29,11 @@ async def test_search_is_scoped_to_the_exact_user_id() -> None:
 
     await index_graph.ainvoke(
         {"docs": "Mitochondria are the powerhouse of the cell."},
-        {"configurable": {"user_id": owner}},
+        context={"user_id": owner},
     )
     await index_graph.ainvoke(
         {"docs": "Mitochondria produce most of the cell's ATP."},
-        {"configurable": {"user_id": lookalike}},
+        context={"user_id": lookalike},
     )
 
     assert set(await search(owner, "mitochondria")) == {owner}

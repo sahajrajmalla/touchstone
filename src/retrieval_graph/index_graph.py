@@ -10,6 +10,9 @@
 
 Every document is stamped with the configured ``user_id`` so retrieval is scoped to
 that user. The graph ends by clearing ``docs`` (the output is ``{"docs": []}``).
+
+Run settings (:class:`~retrieval_graph.configuration.IndexConfiguration`) are the
+graph's context schema: nodes read them from ``runtime.context``.
 """
 
 import logging
@@ -19,6 +22,7 @@ from typing import Any
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 
 from retrieval_graph import retrieval
 from retrieval_graph.configuration import IndexConfiguration
@@ -42,21 +46,19 @@ def is_url_document(doc: Document) -> bool:
 
 
 def ensure_docs_have_user_id(
-    docs: Sequence[Document], config: RunnableConfig
+    docs: Sequence[Document], configuration: IndexConfiguration
 ) -> list[Document]:
     """Ensure that all documents have a user_id in their metadata.
 
-    The user id is resolved like everywhere else (configuration first, then the
-    ``USER_ID`` environment variable).
-
     Args:
         docs: A sequence of Document objects to process.
-        config: A configuration object containing the user_id.
+        configuration: The run settings. Their ``user_id`` defaults to the
+            ``USER_ID`` environment variable.
 
     Returns:
         A new list of Document objects with updated metadata.
     """
-    user_id = IndexConfiguration.from_runnable_config(config).user_id
+    user_id = configuration.user_id
     return [
         Document(
             page_content=doc.page_content, metadata={**doc.metadata, "user_id": user_id}
@@ -65,13 +67,19 @@ def ensure_docs_have_user_id(
     ]
 
 
-async def _add_documents(docs: Sequence[Document], config: RunnableConfig) -> None:
+async def _add_documents(
+    docs: Sequence[Document], configuration: IndexConfiguration
+) -> None:
     """Stamp ``docs`` with the user id and add them to the vector store."""
-    async with retrieval.make_retriever(config) as retriever:
-        await retriever.aadd_documents(ensure_docs_have_user_id(docs, config))
+    async with retrieval.make_retriever(configuration) as retriever:
+        await retriever.aadd_documents(ensure_docs_have_user_id(docs, configuration))
 
 
-async def index_urls(state: IndexState, config: RunnableConfig) -> dict[str, Any]:
+async def index_urls(
+    state: IndexState,
+    config: RunnableConfig,
+    runtime: Runtime[IndexConfiguration] | None = None,
+) -> dict[str, Any]:
     """Index the documents behind any URLs in ``docs``; pass the rest on.
 
     Each URL is fetched and its text extracted. Pages that yield no meaningful
@@ -104,7 +112,8 @@ async def index_urls(state: IndexState, config: RunnableConfig) -> dict[str, Any
                 valid_docs.append(doc)
 
         if valid_docs:
-            await _add_documents(valid_docs, config)
+            configuration = IndexConfiguration.from_runtime(runtime, config)
+            await _add_documents(valid_docs, configuration)
             logger.info("Indexed %d document(s) from URLs.", len(valid_docs))
 
         if failures:
@@ -130,16 +139,21 @@ async def index_urls(state: IndexState, config: RunnableConfig) -> dict[str, Any
     return {"docs": remaining}
 
 
-async def index_docs(state: IndexState, config: RunnableConfig) -> dict[str, str]:
+async def index_docs(
+    state: IndexState,
+    config: RunnableConfig,
+    runtime: Runtime[IndexConfiguration] | None = None,
+) -> dict[str, str]:
     """Index the plain-text documents in ``docs``, then clear them from the state."""
     if state.docs:
-        await _add_documents(state.docs, config)
+        configuration = IndexConfiguration.from_runtime(runtime, config)
+        await _add_documents(state.docs, configuration)
         logger.info("Indexed %d text document(s).", len(state.docs))
     return {"docs": "delete"}
 
 
-# `config_schema` is kept on purpose; see the note in graph.py.
-builder = StateGraph(IndexState, config_schema=IndexConfiguration)  # type: ignore[call-arg]
+# Run settings are the context schema, as in graph.py.
+builder = StateGraph(IndexState, context_schema=IndexConfiguration)
 builder.add_node("index_docs", index_docs)
 builder.add_node("index_urls", index_urls)
 builder.add_edge(START, "index_urls")  # Process URLs first

@@ -3,6 +3,9 @@
 The UI never imports the graphs directly: it talks to the same LangGraph API that
 LangGraph Studio uses (``make dev``), so it works unchanged against a deployed
 server - just point ``TOUCHSTONE_API_URL`` at it.
+
+Run settings are sent as the run ``context`` (the graphs' context schema), never as
+``config["configurable"]``: the server rejects a run that sets both.
 """
 
 from collections.abc import Iterator, Mapping, Sequence
@@ -10,7 +13,6 @@ from typing import Any
 
 import httpx
 from langgraph_sdk import get_sync_client
-from langgraph_sdk.schema import Config
 
 RETRIEVAL_GRAPH = "retrieval_graph"
 INDEX_GRAPH = "indexer"
@@ -54,31 +56,34 @@ class TouchstoneClient:
         return str(thread["thread_id"])
 
     def ask(
-        self, thread_id: str, question: str, configurable: Mapping[str, Any]
+        self, thread_id: str, question: str, context: Mapping[str, Any]
     ) -> Iterator[tuple[str, Any]]:
-        """Stream ``(event, data)`` updates while the agents answer ``question``."""
+        """Stream ``(event, data)`` updates while the agents answer ``question``.
+
+        ``context`` holds the run settings (``user_id``, models, web search).
+        """
         payload: dict[str, Any] = {"messages": [{"role": "user", "content": question}]}
         try:
             for part in self._sdk.runs.stream(
                 thread_id,
                 RETRIEVAL_GRAPH,
                 input=payload,
-                config=Config(configurable=dict(configurable)),
+                context=dict(context),
                 stream_mode="updates",
             ):
                 yield part.event, part.data
         except httpx.HTTPError as e:
             raise BackendError(_describe(e)) from e
 
-    def index(self, docs: Sequence[str], configurable: Mapping[str, Any]) -> None:
-        """Add ``docs`` (plain text or URLs) to the user's knowledge base."""
+    def index(self, docs: Sequence[str], context: Mapping[str, Any]) -> None:
+        """Add ``docs`` (plain text or URLs) to the knowledge base of ``context``'s user."""
         payload: dict[str, Any] = {"docs": list(docs)}
         try:
             result = self._sdk.runs.wait(
                 None,
                 INDEX_GRAPH,
                 input=payload,
-                config=Config(configurable=dict(configurable)),
+                context=dict(context),
                 raise_error=False,
             )
         except httpx.HTTPError as e:

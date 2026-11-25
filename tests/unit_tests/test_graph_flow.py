@@ -1,6 +1,7 @@
 """End-to-end runs of the retrieval graph with scripted models (no network)."""
 
 import importlib
+import warnings
 from typing import Any
 
 import pytest
@@ -9,16 +10,19 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from retrieval_graph import graph
+from retrieval_graph.configuration import Configuration
 from retrieval_graph.state import State
 
-from .conftest import FakeKnowledgeBase, FakeLLM, config, tool_call
+from .conftest import FakeKnowledgeBase, FakeLLM, context, runtime, tool_call
 
 graph_module = importlib.import_module("retrieval_graph.graph")
 
+CONFIGURABLE_DEPRECATED = r"config\['configurable'\] is deprecated"
 
-async def ask(question: str | list[Any], **configurable: Any) -> dict[str, Any]:
+
+async def ask(question: str | list[Any], **settings: Any) -> dict[str, Any]:
     messages = [HumanMessage(question)] if isinstance(question, str) else question
-    return await graph.ainvoke({"messages": messages}, config(**configurable))
+    return await graph.ainvoke({"messages": messages}, context=context(**settings))
 
 
 ######################
@@ -63,6 +67,64 @@ async def test_uses_configured_models(
         ("specialist", "anthropic/r-model"),
         ("critique", "anthropic/r-model"),
     }
+
+
+######################
+# Run settings (context, and the deprecated `configurable` fallback)
+######################
+
+
+@pytest.mark.parametrize(
+    "run_context",
+    [{"user_id": "carol"}, Configuration(user_id="carol")],
+    ids=["dict", "instance"],
+)
+async def test_the_run_context_selects_the_knowledge_base(
+    fake_llm: FakeLLM, knowledge_base: FakeKnowledgeBase, run_context: Any
+) -> None:
+    fake_llm.specialist_replies = [tool_call()]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        await graph.ainvoke({"messages": [HumanMessage("Q")]}, context=run_context)
+    assert knowledge_base.user_ids == ["carol"]
+    assert not [w for w in caught if "configurable" in str(w.message)]
+
+
+async def test_settings_in_configurable_still_work_but_are_deprecated(
+    fake_llm: FakeLLM, knowledge_base: FakeKnowledgeBase
+) -> None:
+    fake_llm.specialist_replies = [tool_call()]
+    legacy_config = {
+        "configurable": {"user_id": "bob", "query_model": "anthropic/q-model"}
+    }
+    with pytest.warns(DeprecationWarning, match=CONFIGURABLE_DEPRECATED):
+        await graph.ainvoke({"messages": [HumanMessage("Q")]}, legacy_config)
+    assert knowledge_base.user_ids == ["bob"]
+    assert fake_llm.calls[0].model_name == "anthropic/q-model"
+
+
+async def test_the_context_wins_over_configurable(
+    fake_llm: FakeLLM, knowledge_base: FakeKnowledgeBase
+) -> None:
+    fake_llm.specialist_replies = [tool_call()]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        await graph.ainvoke(
+            {"messages": [HumanMessage("Q")]},
+            {"configurable": {"user_id": "mallory", "query_model": "anthropic/old"}},
+            context=context("alice", query_model="anthropic/new"),
+        )
+    assert knowledge_base.user_ids == ["alice"]
+    assert fake_llm.calls[0].model_name == "anthropic/new"
+    assert not [w for w in caught if "configurable" in str(w.message)]
+
+
+async def test_a_context_without_user_id_is_rejected_before_any_node_runs(
+    fake_llm: FakeLLM,
+) -> None:
+    with pytest.raises(ValueError, match="valid user_id"):
+        await graph.ainvoke({"messages": [HumanMessage("Q")]}, context={})
+    assert fake_llm.calls == []
 
 
 ######################
@@ -165,10 +227,8 @@ async def test_per_turn_state_is_reset_in_a_persistent_thread(
     fake_llm: FakeLLM, knowledge_base: FakeKnowledgeBase
 ) -> None:
     thread_graph = graph_module.builder.compile(checkpointer=InMemorySaver())
-    run_config = {
-        **config(),
-        "configurable": {**config()["configurable"], "thread_id": "t1"},
-    }
+    # `thread_id` stays in `configurable`; only the settings moved to the context.
+    run_config = {"configurable": {"thread_id": "t1"}}
 
     # Turn 1: retrieve a document, get critiqued once, then answer.
     knowledge_base.search_results = [Document(page_content="Turn one document")]
@@ -178,14 +238,16 @@ async def test_per_turn_state_is_reset_in_a_persistent_thread(
         AIMessage("answer 1"),
     ]
     fake_llm.critique_decisions = ["retry", "respond"]
-    await thread_graph.ainvoke({"messages": [HumanMessage("Question one")]}, run_config)
+    await thread_graph.ainvoke(
+        {"messages": [HumanMessage("Question one")]}, run_config, context=context()
+    )
 
     # Turn 2 in the same thread must not see turn 1's documents or critique.
     fake_llm.calls.clear()
     knowledge_base.search_results = []
     fake_llm.specialist_replies = [AIMessage("answer 2")]
     result = await thread_graph.ainvoke(
-        {"messages": [HumanMessage("Question two")]}, run_config
+        {"messages": [HumanMessage("Question two")]}, run_config, context=context()
     )
 
     (prompt,) = fake_llm.prompts("specialist")
@@ -291,9 +353,9 @@ def tavily(monkeypatch: pytest.MonkeyPatch) -> type[FakeTavily]:
     return FakeTavily
 
 
-async def run_tools(*calls: AIMessage, **configurable: Any) -> dict[str, Any]:
+async def run_tools(*calls: AIMessage, **settings: Any) -> dict[str, Any]:
     state = State(messages=[HumanMessage("q"), *calls])
-    return await graph_module.handle_tool_calls(state, config(**configurable))
+    return await graph_module.handle_tool_calls(state, {}, runtime(**settings))
 
 
 async def test_web_search_results_become_documents(tavily: type[FakeTavily]) -> None:
@@ -387,6 +449,6 @@ async def test_only_the_most_recent_documents_are_kept(
 
 async def test_no_tool_calls_is_a_no_op() -> None:
     out = await graph_module.handle_tool_calls(
-        State(messages=[HumanMessage("q")]), config()
+        State(messages=[HumanMessage("q")]), {}, runtime()
     )
     assert out == {"messages": [], "retrieved_docs": []}

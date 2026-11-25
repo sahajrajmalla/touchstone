@@ -50,7 +50,9 @@ The unit tests run the **real compiled graphs** with test doubles from
 - `fake_llm` replaces `load_chat_model` with a scripted model. Set `subject`, queue
   `specialist_replies` and `critique_decisions`, then inspect `calls`.
 - `knowledge_base` replaces `retrieval.make_retriever` with an in-memory store
-  (`search_results`, `added`, `queries`).
+  (`search_results`, `added`, `queries`, and the `user_ids` it was opened for).
+- `context(**settings)` builds the run settings passed as `context=`.
+  `runtime(**settings)` builds the `runtime` argument for calling a node directly.
 
 ```python
 async def test_example(fake_llm, knowledge_base):
@@ -60,10 +62,13 @@ async def test_example(fake_llm, knowledge_base):
         AIMessage("In bowls."),
     ]
     result = await graph.ainvoke(
-        {"messages": [HumanMessage("Where do cats swim?")]}, config()
+        {"messages": [HumanMessage("Where do cats swim?")]}, context=context()
     )
     assert result["messages"][-1].content == "In bowls."
 ```
+
+`pyproject.toml` turns every `LangGraphDeprecationWarning` into a test failure, so the
+graphs stay ready for LangGraph 2.0.
 
 `test_graph_structure.py` pins the graphs' node names, edges and schemas. Studio, saved
 threads and API clients depend on these. If you change the graph on purpose, update the
@@ -131,9 +136,10 @@ documents, caching and response-time monitoring.
 
 ## Known limitations and follow-ups
 
-- **`config_schema` is deprecated** in LangGraph 1.x (removed in 2.0). Moving to
-  `context_schema` + `Runtime` changes how callers pass settings (`context=` instead of
-  `configurable`), so it is a deliberate migration. `langgraph` is pinned below 2.
+- **Settings in `configurable` are deprecated.** Python callers that pass
+  `{"configurable": {...}}` without `context=` still work, with a `DeprecationWarning`.
+  Remove that fallback (`IndexConfiguration.from_runtime`) in a later release. See
+  [Run settings](architecture.md#run-settings-context_schema).
 - **Web search uses `TavilySearchResults`** from `langchain-community`, which is being
   sunset. Migrating to `langchain_tavily.TavilySearch` (different response format) would
   also remove the `langchain-community` dependency. Validate it against the live Tavily API.

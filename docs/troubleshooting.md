@@ -32,7 +32,7 @@ These appear in the UI's trace, in Studio and in the server log.
 | `Error during retrieval: ... Connection refused` | Elasticsearch isn't running: `make es-up`. |
 | `Error during retrieval: ... dimensions` | Documents were indexed with a different embedding model. [Re-index](configuration.md#upgrading-from-earlier-versions). |
 | `Error during web search: ... 401` or `Did not find tavily_api_key` | Set `TAVILY_API_KEY`, or turn web search off (`enable_web_search: false`). |
-| `Please provide a valid user_id` | Set a user ID in the UI sidebar or Studio's configuration, or `USER_ID` in `.env`. |
+| `Please provide a valid user_id` | Set a user ID in the UI sidebar, in Studio's configuration or in the run's `context` in code, or set `USER_ID` in `.env`. |
 | `GraphRecursionError` | Shouldn't happen any more because of the loop guards. If you raised `MAX_TOOL_ROUNDS` / `MAX_CRITIQUE_RETRIES`, also raise the run's `recursion_limit`. |
 | `BlockingError ... synchronous blocking call` (`langgraph dev`) | Code you added does blocking I/O inside an async node. Use an async client or `await asyncio.to_thread(...)`. As a last resort, use `langgraph dev --allow-blocking`. |
 
