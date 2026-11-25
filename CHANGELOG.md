@@ -41,7 +41,7 @@ All notable changes to this project are documented here. The format follows
   setup; `make start` runs the backend and UI together.
 - `.env.example`, `docker-compose.yml` for a local Elasticsearch (`make es-up`), GitHub
   Actions CI (Python 3.11-3.13), pre-commit hooks and `.editorconfig`.
-- 115 offline unit tests (scripted models, in-memory store, headless UI runs) and an
+- 120 offline unit tests (scripted models, in-memory store, headless UI runs) and an
   integration test for user isolation.
 - Documentation in `docs/`: architecture, configuration, UI, Elasticsearch, development and
   troubleshooting.
@@ -53,6 +53,11 @@ All notable changes to this project are documented here. The format follows
 - Python distribution renamed to `touchstone` (import path `retrieval_graph` unchanged).
 - `PyPDF2` replaced by `pypdf`. Unused `msgspec` and `tavily-python` removed.
   `langgraph-api` moved to the dev tools (`langgraph-cli[inmem]`).
+- Web search uses `TavilySearch` from `langchain-tavily` instead of the deprecated
+  `TavilySearchResults`, so `langchain-community` (being sunset) is no longer a dependency.
+  Searches send the same parameters as before. Tavily errors now read
+  `Error during web search: Error 401: Unauthorized` instead of
+  `Exception('Error 401: Unauthorized')`.
 - Strict mypy passes for the whole codebase.
 - `make` targets renamed: `test-integration`, `test-watch` and others. The old names still
   work as aliases.

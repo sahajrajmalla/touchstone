@@ -74,7 +74,7 @@ own, which keeps prompts small and predictable. Follow-ups that depend on an ear
 | Tool | Backend | Notes |
 | --- | --- | --- |
 | `retrieve_documents` | Elasticsearch kNN search in the `langchain_index` index | Filtered to the user's documents; `k` from `search_kwargs` (default 1); each document truncated to 3,000 characters |
-| `web_search` | Tavily (3 results) | Only offered when `enable_web_search` is true; results truncated to 2,000 characters |
+| `web_search` | Tavily via `langchain-tavily` (3 results, `advanced` depth: 2 API credits per search) | Only offered when `enable_web_search` is true; results truncated to 2,000 characters |
 
 The tools are bound to the specialist models so they can request a search, but the
 searches run in the `tools` node (`handle_tool_calls`). Only the 5 most recent documents are
