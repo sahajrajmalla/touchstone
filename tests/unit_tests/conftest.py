@@ -18,8 +18,10 @@ import pytest
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
 from langchain_core.prompt_values import PromptValue
+from langgraph.runtime import Runtime
 
 from retrieval_graph import retrieval
+from retrieval_graph.configuration import Configuration
 
 graph_module = importlib.import_module("retrieval_graph.graph")
 
@@ -51,9 +53,14 @@ def _isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(touchstone_ui.settings, "load_dotenv", lambda **_: False)
 
 
-def config(user_id: str = "alice", **configurable: Any) -> dict[str, Any]:
-    """Build a run config with a ``configurable`` section."""
-    return {"configurable": {"user_id": user_id, **configurable}}
+def context(user_id: str = "alice", **settings: Any) -> dict[str, Any]:
+    """Build a run context: the settings callers pass as ``context=``."""
+    return {"user_id": user_id, **settings}
+
+
+def runtime(user_id: str = "alice", **settings: Any) -> Runtime[Configuration]:
+    """Build the ``runtime`` LangGraph injects into nodes, for direct node calls."""
+    return Runtime(context=Configuration(**context(user_id, **settings)))
 
 
 ######################
@@ -166,6 +173,8 @@ class FakeKnowledgeBase:
     search_results: list[Document] = field(default_factory=list)
     queries: list[str] = field(default_factory=list)
     added: list[Document] = field(default_factory=list)
+    user_ids: list[str] = field(default_factory=list)
+    """The ``user_id`` of the settings each retriever was opened with."""
     opened: int = 0
     closed: int = 0
     error: Exception | None = None
@@ -190,8 +199,9 @@ def knowledge_base(monkeypatch: pytest.MonkeyPatch) -> FakeKnowledgeBase:
     kb = FakeKnowledgeBase()
 
     @asynccontextmanager
-    async def fake_make_retriever(config: Any) -> AsyncIterator[_FakeRetriever]:
+    async def fake_make_retriever(configuration: Any) -> AsyncIterator[_FakeRetriever]:
         kb.opened += 1
+        kb.user_ids.append(configuration.user_id)
         try:
             yield _FakeRetriever(kb)
         finally:

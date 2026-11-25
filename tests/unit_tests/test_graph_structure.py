@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 from retrieval_graph import graph, index_graph
+from retrieval_graph.configuration import Configuration, IndexConfiguration
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -65,12 +66,14 @@ def test_retrieval_graph_io_schemas() -> None:
     }
 
 
-def _configurable_fields(compiled) -> set[str]:  # type: ignore[no-untyped-def]
-    schema = compiled.config_schema().model_json_schema()
-    for definition in schema.get("$defs", {}).values():
-        if "user_id" in definition.get("properties", {}):
-            return set(definition["properties"])
-    raise AssertionError("configurable schema not found")
+def _context_fields(compiled) -> set[str]:  # type: ignore[no-untyped-def]
+    return set(compiled.get_context_jsonschema()["properties"])
+
+
+def test_run_settings_are_the_context_schema() -> None:
+    # Studio's settings panel and the server's context filter both read this schema.
+    assert graph.context_schema is Configuration
+    assert index_graph.context_schema is IndexConfiguration
 
 
 def test_configuration_schema() -> None:
@@ -82,8 +85,8 @@ def test_configuration_schema() -> None:
         "retriever_provider",
         "search_kwargs",
     }
-    assert _configurable_fields(index_graph) == index_fields
-    assert _configurable_fields(graph) == index_fields | {
+    assert _context_fields(index_graph) == index_fields
+    assert _context_fields(graph) == index_fields | {
         "response_system_prompt",
         "response_model",
         "query_system_prompt",

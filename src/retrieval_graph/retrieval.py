@@ -6,7 +6,7 @@ sees the documents they indexed.
 
 Usage::
 
-    async with make_retriever(config) as retriever:
+    async with make_retriever(IndexConfiguration(user_id="alice")) as retriever:
         docs = await retriever.ainvoke("photosynthesis")
 """
 
@@ -17,7 +17,6 @@ from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 from langchain_core.embeddings import Embeddings
-from langchain_core.runnables import RunnableConfig
 from langchain_core.vectorstores import VectorStoreRetriever
 
 from retrieval_graph.configuration import IndexConfiguration
@@ -119,16 +118,18 @@ def _make_elastic_retriever(
 
 
 @asynccontextmanager
-async def make_retriever(config: RunnableConfig) -> AsyncIterator[VectorStoreRetriever]:
-    """Create a retriever for the agent, based on the current configuration.
+async def make_retriever(
+    configuration: IndexConfiguration,
+) -> AsyncIterator[VectorStoreRetriever]:
+    """Create a retriever for the user and settings in ``configuration``.
 
-    The underlying Elasticsearch client is closed when the ``async with`` block
-    exits, even if it raises.
+    Graph nodes pass the run's settings (``Configuration`` is an
+    ``IndexConfiguration`` too). The underlying Elasticsearch client is closed when
+    the ``async with`` block exits, even if it raises.
 
     Raises:
         ValueError: If the configuration or environment is invalid.
     """
-    configuration = IndexConfiguration.from_runnable_config(config)
     if configuration.retriever_provider not in SUPPORTED_RETRIEVER_PROVIDERS:
         raise ValueError(
             "Unrecognized retriever_provider in configuration. "

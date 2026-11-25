@@ -119,9 +119,8 @@ markers = [
     "integration: needs live services and API keys (Elasticsearch, Anthropic, Google).",
 ]
 filterwarnings = [
-    # Kept on purpose: switching to `context_schema` changes how callers pass
-    # configuration (see docs/development.md). Revisit before LangGraph 2.0.
-    "ignore:`config_schema` is deprecated:DeprecationWarning",
+    # Anything LangGraph 2.0 will remove fails the tests.
+    "error::langgraph.warnings.LangGraphDeprecationWarning",
     # Web search still uses langchain-community's TavilySearchResults; migrating
     # to `langchain-tavily` is tracked in docs/development.md.
     "ignore:`langchain-community` is being sunset:DeprecationWarning",

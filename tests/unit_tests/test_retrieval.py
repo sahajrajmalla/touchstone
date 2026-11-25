@@ -5,6 +5,7 @@ from elasticsearch import AsyncElasticsearch
 from langchain_core.embeddings import DeterministicFakeEmbedding
 
 from retrieval_graph import retrieval
+from retrieval_graph.configuration import IndexConfiguration
 
 
 @pytest.fixture
@@ -71,9 +72,9 @@ async def test_make_retriever_scopes_search_to_user_and_closes_client(
         "k": 2,
         "filter": [{"term": {"metadata.year": 2024}}],
     }
-    config = {"configurable": {"user_id": "alice", "search_kwargs": search_kwargs}}
+    configuration = IndexConfiguration(user_id="alice", search_kwargs=search_kwargs)
 
-    async with retrieval.make_retriever(config) as retriever:
+    async with retrieval.make_retriever(configuration) as retriever:
         assert type(retriever.vectorstore).__name__ == "AsyncElasticsearchStore"
         assert retriever.search_kwargs == {
             "k": 2,
@@ -93,7 +94,7 @@ async def test_make_retriever_scopes_search_to_user_and_closes_client(
 @pytest.mark.usefixtures("elastic_env", "fake_embeddings")
 async def test_make_retriever_defaults_k_to_one() -> None:
     async with retrieval.make_retriever(
-        {"configurable": {"user_id": "alice", "search_kwargs": {}}}
+        IndexConfiguration(user_id="alice", search_kwargs={})
     ) as retriever:
         assert retriever.search_kwargs["k"] == 1
 
@@ -103,7 +104,7 @@ async def test_make_retriever_closes_client_when_block_raises(
     closed_clients: list[AsyncElasticsearch],
 ) -> None:
     with pytest.raises(RuntimeError, match="boom"):
-        async with retrieval.make_retriever({"configurable": {"user_id": "alice"}}):
+        async with retrieval.make_retriever(IndexConfiguration(user_id="alice")):
             raise RuntimeError("boom")
     assert len(closed_clients) == 1
 
@@ -115,7 +116,7 @@ async def test_make_retriever_reports_missing_environment(
     monkeypatch.setenv("ELASTICSEARCH_URL", "")
     monkeypatch.setenv("ELASTICSEARCH_PASSWORD", "")  # empty is allowed
     with pytest.raises(ValueError) as excinfo:
-        async with retrieval.make_retriever({"configurable": {"user_id": "alice"}}):
+        async with retrieval.make_retriever(IndexConfiguration(user_id="alice")):
             pass
     message = str(excinfo.value)
     assert "ELASTICSEARCH_URL, ELASTICSEARCH_USER" in message
@@ -126,6 +127,6 @@ async def test_make_retriever_reports_missing_environment(
 async def test_make_retriever_rejects_unknown_provider() -> None:
     with pytest.raises(ValueError, match="Expected one of: elastic-local"):
         async with retrieval.make_retriever(
-            {"configurable": {"user_id": "alice", "retriever_provider": "pinecone"}}
+            IndexConfiguration(user_id="alice", retriever_provider="pinecone")  # type: ignore[arg-type]
         ):
             pass

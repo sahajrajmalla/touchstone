@@ -17,6 +17,9 @@ Flow for every user turn::
 
 To add a specialist, add a prompt in :mod:`retrieval_graph.prompts`, register it in
 ``SPECIALISTS`` below and extend the ``subject`` literal in ``QueryClassification``.
+
+Run settings (:class:`~retrieval_graph.configuration.Configuration`) are the graph's
+context schema: nodes read them from ``runtime.context``.
 """
 
 from collections.abc import Awaitable, Callable, Hashable, Sequence
@@ -28,6 +31,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_core.tools import tool
 from langgraph.graph import END, START, StateGraph
+from langgraph.runtime import Runtime
 from pydantic import BaseModel
 
 from retrieval_graph import prompts, retrieval
@@ -132,14 +136,16 @@ def get_latest_user_question(state: State) -> str:
     return get_message_text(state.messages[0]) if state.messages else ""
 
 
-async def classify_query(state: State, config: RunnableConfig) -> NodeUpdate:
+async def classify_query(
+    state: State, config: RunnableConfig, runtime: Runtime[Configuration] | None = None
+) -> NodeUpdate:
     """Classify the user's query into subject areas.
 
     This is the first node of every turn, so it also clears the per-turn fields:
     in a persistent thread (LangGraph Studio, the Touchstone UI) the previous
     question's documents and critique would otherwise leak into this one.
     """
-    configuration = Configuration.from_runnable_config(config)
+    configuration = Configuration.from_runtime(runtime, config)
     user_question = get_latest_user_question(state)
 
     prompt = ChatPromptTemplate.from_template(prompts.CLASSIFICATION_SYSTEM_PROMPT)
@@ -207,11 +213,11 @@ WEB_SEARCH_MAX_RESULTS = 3
 
 
 async def _run_retrieval(
-    query: str, config: RunnableConfig
+    query: str, configuration: Configuration, config: RunnableConfig
 ) -> tuple[str, list[Document]]:
     """Search the knowledge base; return the tool message text and new documents."""
     try:
-        async with retrieval.make_retriever(config) as retriever:
+        async with retrieval.make_retriever(configuration) as retriever:
             docs = await retriever.ainvoke(query, config)
     except Exception as e:
         return f"Error during retrieval: {e!s}", []
@@ -219,7 +225,7 @@ async def _run_retrieval(
     if not docs:
         content = "No documents found in the knowledge base for this query."
         # Suggest the web_search tool when local retrieval found nothing.
-        if Configuration.from_runnable_config(config).enable_web_search:
+        if configuration.enable_web_search:
             content += "\nYou may want to try using web_search for this query."
         return content, []
 
@@ -244,10 +250,9 @@ async def _run_retrieval(
 
 
 async def _run_web_search(
-    query: str, config: RunnableConfig
+    query: str, configuration: Configuration
 ) -> tuple[str, list[Document]]:
     """Search the web with Tavily; return the tool message text and new documents."""
-    configuration = Configuration.from_runnable_config(config)
     if not configuration.enable_web_search:
         return "Web search is disabled in the configuration.", []
 
@@ -303,7 +308,9 @@ async def _run_web_search(
     return f"Found {len(web_docs)} relevant web result(s):\n\n{summary}", web_docs
 
 
-async def handle_tool_calls(state: State, config: RunnableConfig) -> NodeUpdate:
+async def handle_tool_calls(
+    state: State, config: RunnableConfig, runtime: Runtime[Configuration] | None = None
+) -> NodeUpdate:
     """Execute the tool calls requested by the last specialist message."""
     messages_to_add: list[ToolMessage] = []
     retrieved_docs = list(state.retrieved_docs)
@@ -312,14 +319,15 @@ async def handle_tool_calls(state: State, config: RunnableConfig) -> NodeUpdate:
     if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
         return {"messages": messages_to_add, "retrieved_docs": retrieved_docs}
 
+    configuration = Configuration.from_runtime(runtime, config)
     for tool_call in last_message.tool_calls:
         tool_name = tool_call["name"]
         query = tool_call["args"].get("query", "")
 
         if tool_name == "retrieve_documents":
-            content, new_docs = await _run_retrieval(query, config)
+            content, new_docs = await _run_retrieval(query, configuration, config)
         elif tool_name == "web_search":
-            content, new_docs = await _run_web_search(query, config)
+            content, new_docs = await _run_web_search(query, configuration)
         else:
             content, new_docs = f"Unknown tool: {tool_name}", []
 
@@ -339,10 +347,12 @@ async def handle_tool_calls(state: State, config: RunnableConfig) -> NodeUpdate:
 
 
 async def _run_specialist(
-    state: State, config: RunnableConfig, prompt_template: str
+    state: State,
+    configuration: Configuration,
+    config: RunnableConfig,
+    prompt_template: str,
 ) -> NodeUpdate:
     """Answer the user's question with a subject-specific prompt and tools."""
-    configuration = Configuration.from_runnable_config(config)
     user_question = get_latest_user_question(state)
     tool_rounds = _tool_rounds_this_turn(state)
     can_use_tools = tool_rounds < MAX_TOOL_ROUNDS
@@ -396,8 +406,13 @@ def _make_specialist(
 ) -> Callable[..., Awaitable[NodeUpdate]]:
     """Create a specialist agent node bound to one subject prompt."""
 
-    async def specialist(state: State, config: RunnableConfig) -> NodeUpdate:
-        return await _run_specialist(state, config, prompt_template)
+    async def specialist(
+        state: State,
+        config: RunnableConfig,
+        runtime: Runtime[Configuration] | None = None,
+    ) -> NodeUpdate:
+        configuration = Configuration.from_runtime(runtime, config)
+        return await _run_specialist(state, configuration, config, prompt_template)
 
     specialist.__doc__ = description
     return specialist
@@ -414,9 +429,11 @@ literature_agent = _SPECIALIST_NODES["literature_agent"]
 general_agent = _SPECIALIST_NODES["general_agent"]
 
 
-async def critique_agent(state: State, config: RunnableConfig) -> NodeUpdate:
+async def critique_agent(
+    state: State, config: RunnableConfig, runtime: Runtime[Configuration] | None = None
+) -> NodeUpdate:
     """Critique and evaluate the specialist agent's response."""
-    configuration = Configuration.from_runnable_config(config)
+    configuration = Configuration.from_runtime(runtime, config)
     user_question = get_latest_user_question(state)
     retrieved_docs = (
         format_docs_safe(state.retrieved_docs)
@@ -492,12 +509,9 @@ def critique_router(state: State) -> str:
 # Graph
 ######################
 
-# `config_schema` is deprecated in LangGraph 1.x in favour of `context_schema`, but
-# switching changes how callers pass configuration (`configurable` -> `context`),
-# so it is kept until a deliberate migration (see docs/development.md).
-builder = StateGraph(  # type: ignore[call-arg]
-    State, input_schema=InputState, config_schema=Configuration
-)
+# The run settings are the context schema: callers pass `context={...}` (Studio and
+# the LangGraph SDK too) and nodes read `runtime.context`. See docs/architecture.md.
+builder = StateGraph(State, context_schema=Configuration, input_schema=InputState)
 
 builder.add_node("classify_query", classify_query)
 for _name, _node in _SPECIALIST_NODES.items():

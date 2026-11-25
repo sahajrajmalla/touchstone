@@ -4,8 +4,9 @@ import pytest
 from langchain_core.documents import Document
 
 from retrieval_graph import index_graph
+from retrieval_graph.configuration import Configuration, IndexConfiguration
 
-from .conftest import FakeKnowledgeBase, config
+from .conftest import FakeKnowledgeBase, context
 
 index_module = importlib.import_module("retrieval_graph.index_graph")
 
@@ -45,7 +46,7 @@ def fake_url_documents(failures: dict[str, str] | None = None):  # type: ignore[
 async def test_indexes_plain_text_documents(knowledge_base: FakeKnowledgeBase) -> None:
     result = await index_graph.ainvoke(
         {"docs": ["Photosynthesis converts light.", "The Civil War lasted 1861-1865."]},
-        config("alice"),
+        context=context("alice"),
     )
     assert result == {"docs": []}
     assert [d.page_content for d in knowledge_base.added] == [
@@ -57,7 +58,7 @@ async def test_indexes_plain_text_documents(knowledge_base: FakeKnowledgeBase) -
 
 
 async def test_indexes_a_single_string(knowledge_base: FakeKnowledgeBase) -> None:
-    await index_graph.ainvoke({"docs": "Cats swim in bowls."}, config("alice"))
+    await index_graph.ainvoke({"docs": "Cats swim in bowls."}, context=context("alice"))
     (doc,) = knowledge_base.added
     assert doc.page_content == "Cats swim in bowls."
     assert doc.metadata["id"] and doc.metadata["user_id"] == "alice"
@@ -70,7 +71,8 @@ async def test_indexes_urls_and_text_together(
         index_module, "create_documents_from_urls", fake_url_documents()
     )
     await index_graph.ainvoke(
-        {"docs": ["https://example.com/plants", "Some plain notes."]}, config("alice")
+        {"docs": ["https://example.com/plants", "Some plain notes."]},
+        context=context("alice"),
     )
     contents = [d.page_content for d in knowledge_base.added]
     assert contents == [PAGE_TEXT, "Some plain notes."]
@@ -88,7 +90,8 @@ async def test_partial_url_failure_indexes_the_rest(
         fake_url_documents({"https://bad.example": "Failed to access URL: HTTP 404"}),
     )
     await index_graph.ainvoke(
-        {"docs": ["https://good.example", "https://bad.example"]}, config("alice")
+        {"docs": ["https://good.example", "https://bad.example"]},
+        context=context("alice"),
     )
     assert [d.metadata["source"] for d in knowledge_base.added] == [
         "https://good.example"
@@ -106,7 +109,9 @@ async def test_all_urls_failing_raises_a_helpful_error(
     with pytest.raises(
         ValueError, match=r"https://bad.example: Failed to access URL: HTTP 404"
     ):
-        await index_graph.ainvoke({"docs": ["https://bad.example"]}, config("alice"))
+        await index_graph.ainvoke(
+            {"docs": ["https://bad.example"]}, context=context("alice")
+        )
     assert knowledge_base.added == []
 
 
@@ -121,13 +126,17 @@ async def test_short_extractions_are_rejected(
 
     monkeypatch.setattr(index_module, "create_documents_from_urls", tiny)
     with pytest.raises(ValueError, match="Insufficient content extracted"):
-        await index_graph.ainvoke({"docs": ["https://example.com"]}, config("alice"))
+        await index_graph.ainvoke(
+            {"docs": ["https://example.com"]}, context=context("alice")
+        )
 
 
 async def test_empty_input_does_not_touch_the_store(
     knowledge_base: FakeKnowledgeBase,
 ) -> None:
-    assert await index_graph.ainvoke({"docs": []}, config("alice")) == {"docs": []}
+    assert await index_graph.ainvoke({"docs": []}, context=context("alice")) == {
+        "docs": []
+    }
     assert knowledge_base.opened == 0
 
 
@@ -148,6 +157,39 @@ def test_is_url_document(content: str, expected: bool) -> None:
 def test_user_id_falls_back_to_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("USER_ID", "bob")
     (doc,) = index_module.ensure_docs_have_user_id(
-        [Document(page_content="x", metadata={"source": "s"})], {"configurable": {}}
+        [Document(page_content="x", metadata={"source": "s"})], IndexConfiguration()
     )
     assert doc.metadata == {"source": "s", "user_id": "bob"}
+
+
+async def test_settings_in_configurable_still_work_but_are_deprecated(
+    knowledge_base: FakeKnowledgeBase,
+) -> None:
+    with pytest.warns(DeprecationWarning, match=r"config\['configurable'\]"):
+        await index_graph.ainvoke(
+            {"docs": ["Some notes."]}, {"configurable": {"user_id": "bob"}}
+        )
+    assert knowledge_base.user_ids == ["bob"]
+    assert knowledge_base.added[0].metadata["user_id"] == "bob"
+
+
+async def test_a_retrieval_configuration_is_accepted_as_context(
+    knowledge_base: FakeKnowledgeBase,
+) -> None:
+    # A Configuration is an IndexConfiguration, so one object serves both graphs.
+    settings = Configuration(user_id="carol", response_model="anthropic/x")
+    await index_graph.ainvoke({"docs": ["Some notes."]}, context=settings)
+    assert knowledge_base.added[0].metadata["user_id"] == "carol"
+
+
+async def test_the_context_rejects_unknown_settings(
+    knowledge_base: FakeKnowledgeBase,
+) -> None:
+    # A dict context must only hold this graph's settings (LangGraph builds the
+    # IndexConfiguration from it). The LangGraph server drops unknown keys instead.
+    with pytest.raises(TypeError, match="response_model"):
+        await index_graph.ainvoke(
+            {"docs": ["Some notes."]},
+            context={"user_id": "carol", "response_model": "anthropic/x"},
+        )
+    assert knowledge_base.added == []

@@ -1,17 +1,25 @@
-"""Configurable parameters for the indexing and retrieval graphs.
+"""Run settings for the indexing and retrieval graphs.
 
-Values are read from the ``configurable`` section of a run's config - for example the
-configuration panel in LangGraph Studio, the Touchstone UI's sidebar, or
-``graph.ainvoke(inputs, {"configurable": {"user_id": "alice"}})``.
+The settings are the graphs' context schema. They arrive as the run's context - for
+example from the configuration panel in LangGraph Studio, the Touchstone UI's sidebar,
+``client.runs.stream(..., context={...})`` with the LangGraph SDK, or
+``graph.ainvoke(inputs, context={"user_id": "alice"})``.
+
+Runs without a context fall back to the ``configurable`` section of the run's config,
+the way settings were passed before. That fallback is deprecated (see
+:meth:`IndexConfiguration.from_runtime`).
 """
 
 from __future__ import annotations
 
 import os
+import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Annotated, Any, Literal, Self
 
 from langchain_core.runnables import RunnableConfig, ensure_config
+from langgraph.runtime import Runtime
 
 from retrieval_graph import prompts
 
@@ -21,6 +29,13 @@ from retrieval_graph import prompts
 DEFAULT_EMBEDDING_MODEL = "google/gemini-embedding-001"
 DEFAULT_RESPONSE_MODEL = "anthropic/claude-sonnet-5-5"
 DEFAULT_QUERY_MODEL = "anthropic/claude-haiku-5-5"
+
+CONFIGURABLE_DEPRECATION_MESSAGE = (
+    "Passing Touchstone settings in config['configurable'] is deprecated; pass them as "
+    "the run context instead, e.g. graph.ainvoke(inputs, context={'user_id': 'alice'}), "
+    "or context={...} with the LangGraph SDK. The 'configurable' fallback will be "
+    "removed in a future release (see docs/configuration.md)."
+)
 
 
 def normalize_embedding_model(name: str) -> str:
@@ -114,11 +129,64 @@ class IndexConfiguration:
         )
 
     @classmethod
+    def field_names(cls) -> frozenset[str]:
+        """Return the names of the settings this class accepts."""
+        return frozenset(f.name for f in fields(cls) if f.init)
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, Any]) -> Self:
+        """Create an instance from ``values``, ignoring keys that are not settings."""
+        names = cls.field_names()
+        return cls(**{k: v for k, v in values.items() if k in names})
+
+    @classmethod
+    def from_runtime(
+        cls, runtime: Runtime[Any] | None, config: RunnableConfig | None = None
+    ) -> Self:
+        """Return the settings of the current run.
+
+        The run's context wins: LangGraph has already turned a ``context={...}`` dict
+        into an instance of the graph's context schema, with defaults filled in.
+
+        Without a context (``runtime`` is None, or a library call without
+        ``context=``), the settings are read from ``config["configurable"]`` instead,
+        with a ``DeprecationWarning`` if it contains any setting. ``thread_id`` and
+        other non-settings keys stay in ``configurable`` and never warn.
+
+        Args:
+            runtime: The ``runtime`` LangGraph injects into a node, or None.
+            config: The run's config; only read when there is no context.
+
+        Raises:
+            TypeError: If the context is neither settings nor a mapping.
+            ValueError: If no valid ``user_id`` is configured.
+        """
+        context = runtime.context if runtime is not None else None
+        if isinstance(context, cls):
+            return context
+        if isinstance(context, IndexConfiguration):
+            # The indexer's settings given to the retrieval graph: keep the values.
+            return cls.from_mapping(vars(context))
+        if isinstance(context, Mapping):
+            return cls.from_mapping(context)
+        if context is not None:
+            raise TypeError(
+                f"Expected the run context to be a {cls.__name__} or a dict, "
+                f"got {type(context).__name__}."
+            )
+        configurable = ensure_config(config).get("configurable") or {}
+        if not cls.field_names().isdisjoint(configurable):
+            warnings.warn(
+                CONFIGURABLE_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=2
+            )
+        return cls.from_mapping(configurable)
+
+    @classmethod
     def from_runnable_config(cls, config: RunnableConfig | None = None) -> Self:
         """Create an instance from the ``configurable`` section of a RunnableConfig.
 
         Unknown keys (for example ``thread_id``, which the LangGraph server adds) are
-        ignored.
+        ignored. Graph nodes use :meth:`from_runtime`, which prefers the run context.
 
         Args:
             config: The configuration object to use.
@@ -126,10 +194,7 @@ class IndexConfiguration:
         Returns:
             An instance of the class with the specified configuration.
         """
-        config = ensure_config(config)
-        configurable = config.get("configurable") or {}
-        _fields = {f.name for f in fields(cls) if f.init}
-        return cls(**{k: v for k, v in configurable.items() if k in _fields})
+        return cls.from_mapping(ensure_config(config).get("configurable") or {})
 
 
 @dataclass(kw_only=True)
